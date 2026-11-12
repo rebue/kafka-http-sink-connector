@@ -3,8 +3,8 @@
 把 Kafka 记录投递到 HTTP 端点的 Kafka Connect Sink 插件。零第三方运行时依赖，只用
 `connect-api` + `slf4j`（都由 worker 提供）。
 
-> **2.0 不兼容 1.x / 3.5.x**：包名统一为 `rebue.kafka.httpsink`，配置键统一到 `http.*`
-> 命名空间。迁移见[从 3.5.x 迁移](#从-35x-迁移)。
+> **不兼容 wheel-kafka 3.5.x**：类名 `rebue.kafka.httpsink.HttpSinkConnector`，配置键统一到
+> `http.*` 命名空间。尚未正式上线，版本号仍是 1.0.0。迁移见[从 3.5.x 迁移](#从-35x-迁移)。
 
 ## 为什么重写
 
@@ -13,9 +13,9 @@ Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消�
 配置全部失效**。反过来，一次下游抖动（`IOException`）被包成 `RuntimeException`，在
 `errors.tolerance=all` 下直接进死信、不重试 —— 语义正好是反的。
 
-2.x 重写的就是这件事，顺带修掉几个会在生产放大的设计缺陷：
+重写的就是这件事，顺带修掉几个会在生产放大的设计缺陷：
 
-| 问题 | 3.5.x | 2.x |
+| 问题 | 3.5.x | 本版 |
 | --- | --- | --- |
 | 失败语义 | 只记日志，offset 照常提交 | 2xx/4xx/5xx 三分类，映射到 Connect 的异常类型 |
 | 重试 | 无 | 指数退避 + 抖动 + 硬时间预算，尊重 `Retry-After` |
@@ -71,7 +71,7 @@ Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消�
 | `http.method` | string | `POST` | `POST` / `PUT` / `PATCH` |
 | `http.protocol` | string | `HTTP_1_1` | `HTTP_1_1` / `HTTP_2`。HTTP_2 对明文要求服务端支持，升级失败会连不上 |
 | `http.content.type` | string | `application/json` | Content-Type |
-| `http.user.agent` | string | `kafka-connect-http-sink/2.0.0` | User-Agent |
+| `http.user.agent` | string | `kafka-connect-http-sink/1.0.0` | User-Agent |
 | `http.compression` | string | `none` | `none` / `gzip` |
 | `http.connect.timeout.ms` | int | `5000` | 建连超时 |
 | `http.request.timeout.ms` | int | `30000` | 单次请求超时（会被剩余预算裁剪） |
@@ -128,17 +128,20 @@ Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消�
 mvn package                      # 产物 target/kafka-http-sink-connector-<version>.jar，约 64KB
 ```
 
-1. 把 jar 放进 worker 的 `plugin.path` 下的**独立子目录**（例如
-   `/opt/kafka/plugins/http-sink-connector/`）；
-2. 同目录下**不要**同时保留 1.x / 3.5.x 的 jar —— 它们定义了同一个连接器类；
-3. 重启 worker。Connect 只在启动时扫描插件目录，**没有热加载**；
-4. `GET /connector-plugins` 确认出现 `rebue.kafka.httpsink.HttpSinkConnector` 且版本为 2.0.0。
+1. 把 jar 直接覆盖到 worker 的 `plugin.path` 下原来的插件目录
+   （例如 `/opt/kafka/plugins/http-sink-connector/`），目录里只留这一个 jar；
+2. 重启 worker。Connect 只在启动时扫描插件目录，**没有热加载**；
+3. `GET /connector-plugins` 确认出现 `rebue.kafka.httpsink.HttpSinkConnector`。
+
+同一个目录里只放这一版：新 jar 与 3.5.x 的 jar 定义了同一个类名
+（`rebue.wheel.kafka.httpsink.HttpSinkConnector` 在 3.5.x 里也存在），同时存在时
+加载哪个由扫描顺序决定，不确定。
 
 ## 从 3.5.x 迁移
 
 三个变化必须一起改，否则连接器起不来或者配置静默失效：
 
-| 项 | 3.5.x | 2.x |
+| 项 | 3.5.x | 本版 |
 | --- | --- | --- |
 | 类名 | `rebue.wheel.kafka.httpsink.HttpSinkConnector` | `rebue.kafka.httpsink.HttpSinkConnector` |
 | 地址 | `http.api.url` | `http.url` |
@@ -156,9 +159,8 @@ mvn package                      # 产物 target/kafka-http-sink-connector-<vers
 ./deploy/migrate-config.py --connect http://kafka01:8083 --connector dtw-to-dtwrs-dtw-region-sink --apply
 ```
 
-顺序不能颠倒：**先**把 2.x 的 jar 放好并重启 worker，**再**改连接器配置。反过来的话，
-PUT 会因为集群上找不到新类而返回 400；而旧类一旦从插件目录删掉，原来的连接器会在下一次
-重启时全部 FAILED（offset 不会丢，补完配置就恢复）。
+顺序不能颠倒：**先**把 jar 替换好并重启 worker，**再**改连接器配置。反过来的话，
+PUT 会因为集群上找不到新类而返回 400。
 
 ## 运维注意
 

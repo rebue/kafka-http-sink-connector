@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""把 Kafka Connect 上 3.5.x 的 HTTP Sink 连接器配置迁移到 2.x 的键名。
+"""把 Kafka Connect 上 3.5.x 的 HTTP Sink 连接器配置迁移到本插件的键名。
 
-2.x 是一次不兼容重写，三个变化必须一起改，否则连接器起不来或者配置静默失效：
+这是一次不兼容重写，三个变化必须一起改，否则连接器起不来或者配置静默失效：
 
   1. connector.class   rebue.wheel.kafka.httpsink.HttpSinkConnector -> rebue.kafka.httpsink.HttpSinkConnector
-  2. http.api.url      -> http.url（2.x 不再读旧键）
+  2. http.api.url      -> http.url（新实现不再读旧键）
   3. max.retries 等    -> http.retry.* 命名空间
 
 用法：
@@ -14,7 +14,7 @@
     # 真正写入
     ./migrate-config.py --connect http://localhost:8083 --connector my-sink --apply
 
-前置条件：2.x 的 jar 已经放进 worker 的 plugin.path 并**重启过 worker**（Connect 只在启动时扫描
+前置条件：新 jar 已经替换进 worker 的 plugin.path 并**重启过 worker**（Connect 只在启动时扫描
 插件目录），否则 PUT 会因为找不到 connector.class 而返回 400。
 """
 
@@ -80,7 +80,7 @@ def migrate(config: dict) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="迁移 HTTP Sink 连接器配置到 2.x")
+    parser = argparse.ArgumentParser(description="迁移 HTTP Sink 连接器配置到本插件")
     parser.add_argument("--connect", required=True, help="Connect REST 地址，例如 http://localhost:8083")
     parser.add_argument("--connector", action="append", default=[],
                         help="连接器名，可重复；省略则处理所有使用旧类的连接器")
@@ -101,7 +101,7 @@ def main() -> int:
         changed = {key: (before.get(key), value) for key, value in after.items() if before.get(key) != value}
         removed = [key for key in before if key not in after]
         if not changed and not removed:
-            print("  配置已是 2.x 形态，跳过")
+            print("  配置已是新形态，跳过")
             continue
         for key, (old, new) in changed.items():
             print(f"  {key}: {old!r} -> {new!r}")
