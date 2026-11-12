@@ -1,158 +1,180 @@
 # kafka-http-sink-connector
 
-Kafka Connect 的 HTTP Sink 连接器，把 Kafka 记录 POST 到 HTTP 端点。
+把 Kafka 记录投递到 HTTP 端点的 Kafka Connect Sink 插件。零第三方运行时依赖，只用
+`connect-api` + `slf4j`（都由 worker 提供）。
 
-这一版是为替换 `rebue.wheel.kafka.httpsink.HttpSinkConnector` 重写的。老实现能跑通「把消息发出去」，
-但在**失败语义**上和 Kafka Connect 的容错机制对不上，导致死信（DLQ）整条链路形同虚设。
+> **2.0 不兼容 1.x / 3.5.x**：包名统一为 `rebue.kafka.httpsink`，配置键统一到 `http.*`
+> 命名空间。迁移见[从 3.5.x 迁移](#从-35x-迁移)。
 
-## 老实现的五个问题
+## 为什么重写
 
-| 问题 | 后果 |
-| --- | --- |
-| `put()` 对 4xx/5xx 只打日志、不抛异常 | Connect 认为投递成功并提交 offset，坏数据静默丢失，DLQ 里没有 |
-| `IOException` 被包成 `RuntimeException` | `errors.tolerance=all` 下直接写 DLQ、**不重试**；一次网络抖动就生成一条死信 |
-| `value.toString()` 当请求体 | `schemas.enable=true` 时是 `Struct{id=1001}`，不是 JSON，下游无法解析 |
-| `taskConfigs()` 只返回 1 份配置 | `tasks.max` 填多少都只有一个 task |
-| `log.info(props)` 打印全部配置 | `http.auth.password` 明文进日志 |
+老实现（`wheel-kafka/http-sink-connector` 3.5.x）对任何 HTTP 状态码都只记一行日志、不抛异常。
+Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消失，`errors.tolerance` 与死信
+配置全部失效**。反过来，一次下游抖动（`IOException`）被包成 `RuntimeException`，在
+`errors.tolerance=all` 下直接进死信、不重试 —— 语义正好是反的。
 
-## 快速开始
+2.x 重写的就是这件事，顺带修掉几个会在生产放大的设计缺陷：
+
+| 问题 | 3.5.x | 2.x |
+| --- | --- | --- |
+| 失败语义 | 只记日志，offset 照常提交 | 2xx/4xx/5xx 三分类，映射到 Connect 的异常类型 |
+| 重试 | 无 | 指数退避 + 抖动 + 硬时间预算，尊重 `Retry-After` |
+| 死信粒度 | 无 | `ErrantRecordReporter` 逐条上报，任务继续跑 |
+| 时间预算 | 无（可能睡穿 poll 间隔触发 rebalance） | 每次 `put()` 有硬预算，超了就抛可重试异常 |
+| 序列化 | `value.toString()`（`Struct{...}` 不是 JSON） | schema 感知的 JSON 写入器，含逻辑类型 |
+| 多 topic 路由 | 所有记录打一个地址 | `http.url` 支持 `${topic}`，按 topic 路由 |
+| 批量 | 无 | 数组 + 可选信封，失败可拆单定位坏记录 |
+| 多 task | `taskConfigs` 只返回 1 份 | 按 `tasks.max` 分发 |
+| 密钥 | 启动时 `log.info(props)` 打印全部配置 | 只打印脱敏摘要 |
+
+## 错误语义
+
+整条死信链路成立与否，全看这张表。插件把 HTTP 响应翻译成 Connect 认识的三类：
+
+| 情况 | 判定 | Connect 侧行为 |
+| --- | --- | --- |
+| 2xx | 成功 | 提交 offset |
+| 408 / 425 / 429 / 5xx | 可重试 | 插件内退避重试；用尽后抛 `RetriableException`，框架按 `errors.retry.*` 再来一轮，**不提交 offset** |
+| 3xx | 不可重试 | 抛 `DataException`（不跟随重定向：POST 被 301/302 改写为 GET 会丢掉请求语义） |
+| 400 / 404 / 409 / 415 / 422 … | 不可重试 | 抛 `DataException`，`errors.tolerance=all` 时进死信 |
+| 401 / 403 | 不可重试 | 抛 `DataException`，异常信息直接点明"检查 http.auth.*" |
+| 连接失败 / 读超时 / TLS 握手失败 | 可重试 | 同 5xx |
+| 序列化失败 | 不可重试 | 记录级问题，按 `behavior.on.error` 处理 |
+
+`behavior.on.error` 决定记录级失败怎么落地：
+
+- `fail`（默认）：抛给框架，由 `errors.tolerance` 决定进死信还是让任务失败。
+- `report`：交给 `ErrantRecordReporter` **逐条**进死信，任务继续跑、offset 正常提交。需要
+  同时配 `errors.tolerance=all` 与 `errors.deadletterqueue.topic.name`；否则自动退回 `fail`。
+- `skip`：直接丢弃，会丢数据，只在明确接受时才用。
+
+> 逐条上报比"整批抛异常"精确：Connect 的 `put()` 是批量的，一条记录抛异常会连带整批走同一
+> 分支；`report` 只把真正失败的那几条送进死信。
+
+## 投递保证
+
+**至少一次**。重试、任务重启、rebalance 都会让同一条记录被投递多次，所以下游需要幂等。插件
+为此给出两组坐标：
+
+- 单条模式：`X-Kafka-Topic` / `X-Kafka-Partition` / `X-Kafka-Offset` / `X-Kafka-Timestamp` /
+  `X-Kafka-Key`，以及可直接去重的 `X-Idempotency-Key: {topic}-{partition}-{offset}`；
+- 批量模式：请求头里的坐标会失真，打开 `http.batch.envelope=true` 让每条记录带
+  `{"metadata":{...},"value":...}`。
+
+单分区内顺序由"同步发送、串行投递"保证；需要**跨分区**有序就把 `tasks.max` 设为 1。
+
+## 配置
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `http.url` | string | **必填** | 目标地址，仅 http/https。支持 `${topic}` 占位符。不允许带用户名密码 |
+| `http.method` | string | `POST` | `POST` / `PUT` / `PATCH` |
+| `http.protocol` | string | `HTTP_1_1` | `HTTP_1_1` / `HTTP_2`。HTTP_2 对明文要求服务端支持，升级失败会连不上 |
+| `http.content.type` | string | `application/json` | Content-Type |
+| `http.user.agent` | string | `kafka-connect-http-sink/2.0.0` | User-Agent |
+| `http.compression` | string | `none` | `none` / `gzip` |
+| `http.connect.timeout.ms` | int | `5000` | 建连超时 |
+| `http.request.timeout.ms` | int | `30000` | 单次请求超时（会被剩余预算裁剪） |
+| `http.delivery.budget.ms` | int | `60000` | **单次 `put()` 的总预算**，0 表示不限。必须明显小于 `consumer.max.poll.interval.ms` |
+| `http.retry.max` | int | `8` | 插件内最多重试几次（不含首次） |
+| `http.retry.backoff.ms` | int | `500` | 首次退避，之后指数增长 |
+| `http.retry.backoff.max.ms` | int | `30000` | 退避上限，同时约束 `Retry-After` |
+| `http.retry.jitter.ms` | int | `250` | 退避抖动上限 |
+| `http.headers.*` | string | — | 自定义请求头，如 `http.headers.X-Tenant=acme`。`Host`/`Authorization` 等保留头会被忽略 |
+| `http.metadata.headers.enabled` | bool | `true` | 是否发送源坐标头与幂等键 |
+| `http.header.forward` | list | `[]` | 透传哪些 Kafka 记录头（前缀 `x-kafka-header-`），`*` 表示全部 |
+| `http.payload.format` | string | `auto` | `auto` 按值类型分派；`json` 一律序列化；`text` 一律纯文本 |
+| `http.payload.bytes.encoding` | string | `base64` | byte[] 的编码：`base64` / `utf8` |
+| `http.batch.enabled` | bool | `false` | 多条记录拼成一个 JSON 数组 |
+| `http.batch.max.records` | int | `100` | 单批最大条数 |
+| `http.batch.envelope` | bool | `false` | 每条包成 `{metadata, value}` |
+| `http.batch.isolate.failures` | bool | `true` | 批量失败时拆单重投以定位坏记录（会产生重复投递） |
+| `http.auth.type` | string | `none` | `none` / `basic` / `bearer` |
+| `http.auth.username` / `http.auth.password` | string | — | basic 认证；`http.auth.type=basic` 时必填 |
+| `http.auth.token` | password | — | bearer 认证；`http.auth.type=bearer` 时必填 |
+| `http.tls.truststore.path` / `.password` / `.type` | string | — / — / `JKS` | 校验自签证书的服务端 |
+| `http.tls.insecure` | bool | `false` | 跳过证书校验，**仅限联调** |
+| `behavior.on.error` | string | `fail` | `fail` / `report` / `skip` |
+| `http.stats.interval.ms` | int | `60000` | 投递汇总日志间隔，0 关闭 |
+
+配置错误在 `POST/PUT /connectors` 时就会返回，并被 `PUT /connector-plugins/{class}/config/validate`
+定位到具体键（跨字段问题也一样），不必等 task 反复 FAILED 才发现。
+
+### 配置示例
 
 ```json
 {
-  "name": "http-sink-orders",
+  "name": "orders-http-sink",
   "config": {
     "connector.class": "rebue.kafka.httpsink.HttpSinkConnector",
-    "topics": "dbz.orders",
     "tasks.max": "1",
-    "http.url": "http://magic-api:9999/sync/${topic}",
-    "max.retries": "10",
-    "retry.backoff.ms": "3000",
-    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter.schemas.enable": "false"
+    "topics": "orders",
+    "http.url": "http://downstream:8080/sync/${topic}",
+    "http.retry.max": "5",
+    "http.delivery.budget.ms": "30000",
+    "behavior.on.error": "report",
+
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "connect-dlq",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.retry.timeout": "300000"
   }
 }
 ```
 
-```bash
-curl -X PUT -H 'Content-Type: application/json' \
-  http://127.0.0.1:8083/connectors/http-sink-orders/config \
-  -d @config.json
-```
-
-## 错误语义（这是重点）
-
-| 下游响应 | 插件行为 | 框架行为 |
-| --- | --- | --- |
-| 2xx | 成功 | 提交 offset |
-| 408 / 429 / 5xx / 连接超时 / 读超时 | 先按 `max.retries` 重试，仍失败抛 `RetriableException` | 按 `errors.retry.*` 再重试，超时后写 DLQ |
-| 其它 4xx（400/401/403/404/409…） | 直接抛 `DataException`，不重试 | `errors.tolerance=all` 下写 DLQ |
-| 3xx | 视为配置错误，不重试（不跟随重定向） | 同上 |
-
-被判为「成功」的记录会提交 offset；被判为「失败」的记录**不会**提交，进 DLQ 后由人工重投。
-所以下游必须用**非 2xx** 表达业务失败；用 HTTP 200 + `{"result":-2}` 的话，任何连接器都接不住。
-
-## 幂等：一定会重复投递
-
-重试、task 重启、rebalance 都会让同一条记录被 POST 多次，这是 at-least-once 的固有语义。
-
-默认每个请求带这些头，下游可据此去重：
-
-```
-X-Kafka-Topic: dbz.orders
-X-Kafka-Partition: 3
-X-Kafka-Offset: 1042
-X-Kafka-Timestamp: 1762912345678
-X-Kafka-Key: 1001
-```
-
-关掉：`http.metadata.headers.enable=false`。
-
-## 配置
-
-### 目标与请求
-
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `http.url` | 必填 | 支持 `${topic}` 占位符；只支持这一种占位符 |
-| `http.api.url` | — | 已废弃，`http.url` 为空时回落到它 |
-| `http.method` | `POST` | `POST` / `PUT` / `PATCH` |
-| `http.version` | `HTTP_1_1` | `HTTP_1_1` / `HTTP_2`；明文 HTTP/2 依赖服务端支持 |
-| `http.content.type` | `application/json` | 老配置 `http.header.content-type` 仍生效 |
-| `http.user.agent` | `kafka-connect-http-sink/1.0.0` | |
-| `http.compression` | `none` | `gzip` 需要下游支持 `Content-Encoding` |
-| `http.header.<名字>` | — | 自定义请求头，如 `http.header.X-Tenant=acme` |
-
-### 超时与重试
-
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `http.connect.timeout.ms` | `5000` | 建连超时 |
-| `http.request.timeout.ms` | `30000` | 单次请求读超时 |
-| `http.retry.total.timeout.ms` | `120000` | 单条记录的重试总预算，**必须小于 `max.poll.interval.ms`** |
-| `max.retries` | `10` | 与 Confluent HTTP Sink 同名，dbz 注入即可生效 |
-| `retry.backoff.ms` | `3000` | 首次退避，之后按 2 的幂增长 |
-| `retry.backoff.max.ms` | `30000` | 退避上限 |
-| `retry.jitter.ms` | `1000` | 抖动上限，避免多个 task 同时重试打崩下游 |
-
-`Retry-After` 响应头会被尊重（仅支持秒数形式）。
-
-### 行为
-
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `behavior.on.error` | `fail` | `fail` 抛给框架（进 DLQ）；`log`/`ignore` 会**丢数据**，仅限明确接受时使用 |
-| `value.format` | `auto` | `auto` / `string` / `json` / `bytes` |
-| `value.bytes.encoding` | `base64` | `base64` / `utf8` |
-| `http.metadata.headers.enable` | `true` | 是否带 `X-Kafka-*` 坐标头 |
-| `http.header.forward` | `false` | 是否把记录 headers 透传成 `x-kafka-header-*` |
-| `http.batch.enabled` | `false` | 合成 JSON 数组一次发送 |
-| `http.batch.max.size` | `100` | 单请求最多条数 |
-| `http.batch.envelope` | `false` | 元素包成 `{"metadata":{...},"value":...}`，批量下也能幂等 |
-
-`value.format=auto` 的规则：字符串原样输出（配合 `JsonConverter` + `schemas.enable=false`）、
-`Struct`/`Map` 转 JSON、逻辑类型按语义渲染（`Decimal` → 数字、`Timestamp` → ISO-8601、`bytes` → BASE64）。
-
-### 认证与 TLS
-
-| 键 | 默认 | 说明 |
-| --- | --- | --- |
-| `http.auth.type` | `none` | `none` / `basic` / `bearer` |
-| `http.auth.username` / `http.auth.password` | — | basic；密码是 `PASSWORD` 类型，Connect REST 返回时打码，不落日志 |
-| `http.auth.token` | — | bearer |
-| `http.tls.truststore.path` / `.password` / `.type` | — / — / `JKS` | 自签证书用；路径必须在每个 worker 本地存在 |
-| `http.tls.insecure.skip.verify` | `false` | **仅联调**，启动时会 warn |
-
-## 迁移
-
-1. 把 `target/kafka-http-sink-connector-1.0.0.jar` 放进每个 worker 的 `plugin.path`；
-2. **删掉老的 `http-sink-connector` jar**（同一个类名出现在两个 jar 里时，加载哪个不确定）；
-3. 重启 worker（Connect 没有热加载插件的接口）；
-4. 已有连接器可以不改配置：`connector.class` 为 `rebue.wheel.kafka.httpsink.HttpSinkConnector`
-   时由兼容类接管；新连接器建议用 `rebue.kafka.httpsink.HttpSinkConnector`。
-
-`GET /connector-plugins` 里应能看到两个同名不同包的条目（迁移期正常）。
-
-## 与 dbz 配合
-
-- dbz 会注入 `errors.tolerance=all`、`errors.deadletterqueue.*`、`max.retries`、`retry.backoff.ms`——
-  这些键本插件全部认识，注入即生效（老实现只认 4 个键，注入等于没注）。
-- 死信记录由 Connect 写入 DLQ topic，`__connect.errors.*` 头里带源 topic/partition/offset、
-  异常类名与堆栈，dbz 据此在死信页展示与重投。
-- 重投是写回**源 topic**，会重新走一遍转换器与 SMT；若该 topic 被多条 sink 订阅，它们都会再收到一次。
-
-## 构建
+## 构建与部署
 
 ```bash
-mvn package          # 跑测试 + 打 shaded jar，产物无第三方依赖
+mvn package                      # 产物 target/kafka-http-sink-connector-<version>.jar，约 64KB
 ```
 
-Java 17+。插件只依赖 `connect-api` / `kafka-clients`（provided，worker 自带），
-不打包 Jackson，避免与 worker 的 classpath 冲突。
+1. 把 jar 放进 worker 的 `plugin.path` 下的**独立子目录**（例如
+   `/opt/kafka/plugins/http-sink-connector/`）；
+2. 同目录下**不要**同时保留 1.x / 3.5.x 的 jar —— 它们定义了同一个连接器类；
+3. 重启 worker。Connect 只在启动时扫描插件目录，**没有热加载**；
+4. `GET /connector-plugins` 确认出现 `rebue.kafka.httpsink.HttpSinkConnector` 且版本为 2.0.0。
 
-## 边界
+## 从 3.5.x 迁移
 
-- 不跟随重定向：POST 被 3xx 重定向时语义会丢，配置里直接写最终地址。
-- 批量模式下整批共享一次响应，没有单条失败粒度；需要逐条 DLQ 时不要开批量。
-- 多 task 只保证单分区内有序；需要全局有序时 `tasks.max=1`。
-- 没有实现 `preCommit` 的额外位点管理：失败即不提交，语义由框架保证。
+三个变化必须一起改，否则连接器起不来或者配置静默失效：
+
+| 项 | 3.5.x | 2.x |
+| --- | --- | --- |
+| 类名 | `rebue.wheel.kafka.httpsink.HttpSinkConnector` | `rebue.kafka.httpsink.HttpSinkConnector` |
+| 地址 | `http.api.url` | `http.url` |
+| 重试 | `max.retries` / `retry.backoff.ms` | `http.retry.max` / `http.retry.backoff.ms` |
+| 版本 | `http.version` | `http.protocol` |
+| 报文 | `value.format` / `value.bytes.encoding` | `http.payload.format` / `http.payload.bytes.encoding` |
+
+`deploy/migrate-config.py` 通过 Connect REST 原地改写：
+
+```bash
+# 先看会改成什么（默认只打印差异）
+./deploy/migrate-config.py --connect http://kafka01:8083 --connector dtw-to-dtwrs-dtw-region-sink
+
+# 确认后写入
+./deploy/migrate-config.py --connect http://kafka01:8083 --connector dtw-to-dtwrs-dtw-region-sink --apply
+```
+
+顺序不能颠倒：**先**把 2.x 的 jar 放好并重启 worker，**再**改连接器配置。反过来的话，
+PUT 会因为集群上找不到新类而返回 400；而旧类一旦从插件目录删掉，原来的连接器会在下一次
+重启时全部 FAILED（offset 不会丢，补完配置就恢复）。
+
+## 运维注意
+
+- **死信量会从 0 变成真实值**。切过来之后 4xx 会第一次真正进入死信队列，先确认死信 topic
+  的分区数与副本数扛得住（单 broker 环境需要把 `errors.deadletterqueue.topic.replication.factor`
+  调到 1，否则建 topic 会失败）。
+- **预算与 poll 间隔**：`http.delivery.budget.ms` 必须小于 `consumer.max.poll.interval.ms`。
+  超了会触发 rebalance，一次下游变慢就被放大成重复投递。
+- **批量 + 拆单**会带来重复投递，下游要么幂等，要么关掉 `http.batch.isolate.failures`。
+- 汇总日志（`http.stats.interval.ms`）给出的是"自上次汇总以来"的增量：投递条数、字节数、
+  尝试次数、死信条数、预算耗尽次数。排查时先看它，再去看逐条日志。
+- `http.tls.insecure=true` 会在启动时告警；生产开启等于放弃传输层身份认证。
+
+## 已知边界
+
+- 不支持 OAUTHBEARER / mTLS 客户端证书；需要双向 TLS 的场景请前置网关。
+- 不做请求体分片：单条记录多大就发多大。
+- 批量模式下没有"部分成功"协议：整批共享一个状态码，靠拆单兜底。
+- 死信写入失败会转成可重试异常（记录留在原位），不会静默丢弃，但会让整个 task 回退重试。

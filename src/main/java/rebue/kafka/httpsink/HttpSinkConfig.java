@@ -1,11 +1,13 @@
 package rebue.kafka.httpsink;
 
-import java.net.URI;
-import java.net.URISyntaxException;
+import java.net.http.HttpClient;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.Set;
 
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
@@ -14,325 +16,500 @@ import org.apache.kafka.common.config.ConfigDef.Range;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.ValidString;
 import org.apache.kafka.common.config.ConfigException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import rebue.kafka.httpsink.json.PayloadFormat;
+import rebue.kafka.httpsink.route.UrlTemplate;
+import rebue.kafka.httpsink.support.RequestHeaders;
 
 /**
- * HTTP Sink 的全部配置。
+ * 连接器配置。
  *
- * <p>命名有两条约束：
- * <ul>
- *   <li>与 Kafka Connect / Confluent HTTP Sink 同名的键（{@code max.retries}、{@code retry.backoff.ms}、
- *       {@code topics}、{@code tasks.max}）保持一致，dbz 这类管控面注入的配置不用改就能生效；</li>
- *   <li>本插件特有的键统一挂 {@code http.} 前缀，避免和框架键撞名。</li>
- * </ul>
+ * <p>三条设计原则，都是拿线上问题换来的：
  *
- * <p>老版本的 {@code http.api.url} 仍被接受（值为空时回落到它），{@code http.header.content-type}
- * 会被提升为 Content-Type：老配置只改 {@code connector.class} 即可迁移。
+ * <ol>
+ *   <li><b>键名只守一个命名空间</b>：{@code http.*} 全是插件自己的语义；Kafka Connect 的
+ *       {@code errors.*}、{@code consumer.*} 归框架。两套混用会出现"页面上填了、实际没人读"
+ *       的假配置。</li>
+ *   <li><b>能在启动期报的错，绝不拖到第一条记录</b>。地址写错、认证缺密码、批量配了纯文本，
+ *       这些都在 {@code PUT /connectors} 时返回 400，而不是让 task 反复 FAILED 重启。</li>
+ *   <li><b>跨字段约束集中在 {@link #problems} 里</b>，连接器的 {@code validate()} 直接复用，
+ *       保证"页面校验"和"真正启动"用的是同一套规则。</li>
+ * </ol>
  */
 public final class HttpSinkConfig extends AbstractConfig {
-    private static final Logger log = LoggerFactory.getLogger(HttpSinkConfig.class);
 
-    /* ------------------------------------------------------------ 目标地址 */
+    /* ------------------------------------------------------------------ 目标地址 */
 
-    /** 目标 URL，支持 {@code ${topic}} 占位符 */
     public static final String HTTP_URL = "http.url";
-    /** 老版本的目标 URL，已废弃，仅在 {@code http.url} 为空时使用 */
-    public static final String LEGACY_HTTP_API_URL = "http.api.url";
     public static final String HTTP_METHOD = "http.method";
-    public static final String HTTP_VERSION = "http.version";
+    public static final String HTTP_PROTOCOL = "http.protocol";
     public static final String HTTP_CONTENT_TYPE = "http.content.type";
-    /** 自定义请求头的前缀：{@code http.header.X-Tenant=...} */
-    public static final String HTTP_HEADER_PREFIX = "http.header.";
     public static final String HTTP_USER_AGENT = "http.user.agent";
     public static final String HTTP_COMPRESSION = "http.compression";
 
-    /* ------------------------------------------------------------ 超时与重试 */
+    /* ------------------------------------------------------------------ 超时与重试 */
 
     public static final String HTTP_CONNECT_TIMEOUT_MS = "http.connect.timeout.ms";
     public static final String HTTP_REQUEST_TIMEOUT_MS = "http.request.timeout.ms";
-    /** 单条（或单批）记录的重试总预算，到点就放弃，避免拖住 poll 触发 rebalance */
-    public static final String HTTP_RETRY_TOTAL_TIMEOUT_MS = "http.retry.total.timeout.ms";
-    /** 与 Confluent HTTP Sink 同名：单次请求的重试次数（不含首次） */
-    public static final String MAX_RETRIES = "max.retries";
-    /** 与 Confluent HTTP Sink 同名：首次退避 */
-    public static final String RETRY_BACKOFF_MS = "retry.backoff.ms";
-    public static final String RETRY_BACKOFF_MAX_MS = "retry.backoff.max.ms";
-    public static final String RETRY_JITTER_MS = "retry.jitter.ms";
+    public static final String HTTP_DELIVERY_BUDGET_MS = "http.delivery.budget.ms";
+    public static final String HTTP_RETRY_MAX = "http.retry.max";
+    public static final String HTTP_RETRY_BACKOFF_MS = "http.retry.backoff.ms";
+    public static final String HTTP_RETRY_BACKOFF_MAX_MS = "http.retry.backoff.max.ms";
+    public static final String HTTP_RETRY_JITTER_MS = "http.retry.jitter.ms";
 
-    /* ------------------------------------------------------------ 行为 */
+    /* ------------------------------------------------------------------ 请求头 */
 
-    /** 失败后的行为：fail（抛给框架，进 DLQ）/ log / ignore */
-    public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
-    public static final String BATCH_ENABLED = "http.batch.enabled";
-    public static final String BATCH_MAX_SIZE = "http.batch.max.size";
-    /** 批量模式下是否把每条记录包成 {"metadata":{...},"value":...}，以便下游做幂等 */
-    public static final String BATCH_ENVELOPE = "http.batch.envelope";
-    /** auto / string / json / bytes */
-    public static final String VALUE_FORMAT = "value.format";
-    public static final String VALUE_BYTES_ENCODING = "value.bytes.encoding";
-    /** 把源 topic/partition/offset/timestamp/key 写进请求头，供下游幂等去重 */
-    public static final String METADATA_HEADERS_ENABLE = "http.metadata.headers.enable";
-    /** 把 Kafka 记录自带的 headers 透传成请求头（前缀 x-kafka-header-） */
-    public static final String HEADER_FORWARD = "http.header.forward";
+    /** 动态头前缀：{@code http.headers.X-Tenant=acme} */
+    public static final String HTTP_HEADER_PREFIX = "http.headers.";
+    public static final String HTTP_METADATA_HEADERS = "http.metadata.headers.enabled";
+    public static final String HTTP_HEADER_FORWARD = "http.header.forward";
 
-    /* ------------------------------------------------------------ 认证 / TLS */
+    /* ------------------------------------------------------------------ 报文 */
 
-    public static final String AUTH_TYPE = "http.auth.type";
-    public static final String AUTH_USERNAME = "http.auth.username";
-    public static final String AUTH_PASSWORD = "http.auth.password";
-    public static final String AUTH_TOKEN = "http.auth.token";
+    public static final String HTTP_PAYLOAD_FORMAT = "http.payload.format";
+    public static final String HTTP_PAYLOAD_BYTES_ENCODING = "http.payload.bytes.encoding";
+    public static final String HTTP_BATCH_ENABLED = "http.batch.enabled";
+    public static final String HTTP_BATCH_MAX_RECORDS = "http.batch.max.records";
+    public static final String HTTP_BATCH_ENVELOPE = "http.batch.envelope";
+    public static final String HTTP_BATCH_ISOLATE = "http.batch.isolate.failures";
+
+    /* ------------------------------------------------------------------ 认证与 TLS */
+
+    public static final String HTTP_AUTH_TYPE = "http.auth.type";
+    public static final String HTTP_AUTH_USERNAME = "http.auth.username";
+    public static final String HTTP_AUTH_PASSWORD = "http.auth.password";
+    public static final String HTTP_AUTH_TOKEN = "http.auth.token";
     public static final String TLS_TRUSTSTORE_PATH = "http.tls.truststore.path";
     public static final String TLS_TRUSTSTORE_PASSWORD = "http.tls.truststore.password";
     public static final String TLS_TRUSTSTORE_TYPE = "http.tls.truststore.type";
-    public static final String TLS_INSECURE_SKIP_VERIFY = "http.tls.insecure.skip.verify";
+    public static final String TLS_INSECURE = "http.tls.insecure";
 
-    /** 允许出现在 URL 里的占位符，其余一律在启动时报错 */
-    private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([^}]*)}");
+    /* ------------------------------------------------------------------ 行为与观测 */
 
-    private static final ConfigDef DEFINITION = buildDefinition();
+    public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
+    public static final String HTTP_STATS_INTERVAL_MS = "http.stats.interval.ms";
+
+    private static final ConfigDef DEFINITION = define();
+
+    private final UrlTemplate urlTemplate;
+    private final PayloadFormat payloadFormat;
+    private final boolean bytesAsBase64;
+    private final AuthType authType;
+    private final Behavior behavior;
+    private final List<String> warnings;
 
     public HttpSinkConfig(final Map<String, ?> props) {
         super(DEFINITION, props);
-        validateCrossField();
+        final Problems problems = new Problems();
+        final List<String> notes = new ArrayList<>(headerWarnings());
+
+        this.urlTemplate = compileUrl(problems);
+        this.authType = resolveAuth(problems);
+        this.payloadFormat = PayloadFormat.of(getString(HTTP_PAYLOAD_FORMAT));
+        this.bytesAsBase64 = "base64".equalsIgnoreCase(getString(HTTP_PAYLOAD_BYTES_ENCODING));
+        this.behavior = Behavior.of(getString(BEHAVIOR_ON_ERROR));
+
+        checkSemantics(problems, notes);
+        this.warnings = List.copyOf(notes);
+        if (!problems.isEmpty()) {
+            throw new ProblemsException(problems.message(), problems.byKey());
+        }
     }
 
-    public static ConfigDef configDef() {
-        return DEFINITION;
-    }
-
-    private static ConfigDef buildDefinition() {
+    private static ConfigDef define() {
         final ConfigDef def = new ConfigDef();
 
-        def.define(HTTP_URL, Type.STRING, null, new UrlValidator(), Importance.HIGH,
-                "目标 URL，必须 http/https。支持 ${topic} 占位符，按记录所属 topic 路由。");
-        def.define(LEGACY_HTTP_API_URL, Type.STRING, null, new UrlValidator(), Importance.LOW,
-                "已废弃，等价于 http.url；仅在 http.url 为空时生效。");
-        def.define(HTTP_METHOD, Type.STRING, "POST", ValidString.in("POST", "PUT", "PATCH"), Importance.MEDIUM,
-                "HTTP 方法，默认 POST。");
-        def.define(HTTP_VERSION, Type.STRING, "HTTP_1_1", ValidString.in("HTTP_1_1", "HTTP_2"), Importance.LOW,
-                "HTTP 协议版本。默认 HTTP_1_1：HTTP_2 对明文（h2c）依赖服务端支持，升级失败会直接连不上。");
-        def.define(HTTP_CONTENT_TYPE, Type.STRING, "application/json", null, Importance.MEDIUM,
-                "Content-Type 请求头，默认 application/json。");
-        def.define(HTTP_USER_AGENT, Type.STRING, "kafka-connect-http-sink/" + Version.VERSION, null, Importance.LOW,
-                "User-Agent 请求头。");
-        def.define(HTTP_COMPRESSION, Type.STRING, "none", ValidString.in("none", "gzip"), Importance.LOW,
-                "请求体压缩方式。gzip 需要下游支持 Content-Encoding: gzip。");
+        def.define(HTTP_URL, Type.STRING, ConfigDef.NO_DEFAULT_VALUE,
+                Importance.HIGH,
+                "目标地址，必须是 http/https。支持 ${topic} 占位符，按记录所属 topic 路由到不同端点。");
 
-        def.define(HTTP_CONNECT_TIMEOUT_MS, Type.INT, 5_000, Range.atLeast(1), Importance.LOW,
-                "建立连接的超时（毫秒）。");
+        def.define(HTTP_METHOD, Type.STRING, "POST", ValidString.in("POST", "PUT", "PATCH"),
+                Importance.MEDIUM, "HTTP 方法。");
+
+        def.define(HTTP_PROTOCOL, Type.STRING, "HTTP_1_1", ValidString.in("HTTP_1_1", "HTTP_2"),
+                Importance.LOW,
+                "HTTP 版本。默认 HTTP_1_1：HTTP_2 对明文（h2c）要求服务端支持，升级失败会直接连不上。");
+
+        def.define(HTTP_CONTENT_TYPE, Type.STRING, "application/json", Importance.MEDIUM,
+                "Content-Type 请求头。");
+
+        def.define(HTTP_USER_AGENT, Type.STRING, "kafka-connect-http-sink/" + Version.VERSION,
+                Importance.LOW, "User-Agent 请求头。");
+
+        def.define(HTTP_COMPRESSION, Type.STRING, "none", ValidString.in("none", "gzip"),
+                Importance.LOW, "请求体压缩方式。gzip 要求下游支持 Content-Encoding: gzip。");
+
+        def.define(HTTP_CONNECT_TIMEOUT_MS, Type.INT, 5_000, Range.atLeast(1), Importance.MEDIUM,
+                "建立 TCP 连接的超时。");
+
         def.define(HTTP_REQUEST_TIMEOUT_MS, Type.INT, 30_000, Range.atLeast(1), Importance.MEDIUM,
-                "单次请求的读超时（毫秒）。");
-        def.define(HTTP_RETRY_TOTAL_TIMEOUT_MS, Type.INT, 120_000, Range.atLeast(0), Importance.MEDIUM,
-                "单条记录的重试总预算（毫秒），到点即放弃。必须小于 consumer 的 max.poll.interval.ms，"
-                        + "否则重试期间会被踢出消费组、触发 rebalance。0 表示不限制（不推荐）。");
-        def.define(MAX_RETRIES, Type.INT, 10, Range.atLeast(0), Importance.MEDIUM,
-                "单次投递的重试次数（不含首次）。与 Confluent HTTP Sink 同名，管控面注入即可生效。");
-        def.define(RETRY_BACKOFF_MS, Type.INT, 3_000, Range.atLeast(0), Importance.MEDIUM,
-                "首次退避（毫秒），之后按 2 的幂增长。");
-        def.define(RETRY_BACKOFF_MAX_MS, Type.INT, 30_000, Range.atLeast(0), Importance.MEDIUM,
-                "退避上限（毫秒）。");
-        def.define(RETRY_JITTER_MS, Type.INT, 1_000, Range.atLeast(0), Importance.LOW,
-                "退避抖动上限（毫秒），避免多个 task 同时重试打崩下游。");
+                "单次请求（含等待响应）的超时，由插件自己的重试循环约束。");
 
-        def.define(BEHAVIOR_ON_ERROR, Type.STRING, "fail", ValidString.in("fail", "log", "ignore"), Importance.HIGH,
-                "失败后的行为。fail：抛给框架（配 errors.tolerance=all + DLQ 即进死信），默认；"
-                        + "log：记日志后继续（会丢数据，不建议）；ignore：静默跳过（会丢数据，不建议）。");
-        def.define(BATCH_ENABLED, Type.BOOLEAN, false, null, Importance.LOW,
-                "是否把一批记录合成一个 JSON 数组请求。下游必须支持数组，且整批要么全成功要么全失败。");
-        def.define(BATCH_MAX_SIZE, Type.INT, 100, Range.atLeast(1), Importance.LOW,
-                "批量模式下单个请求最多包含的记录数。");
-        def.define(BATCH_ENVELOPE, Type.BOOLEAN, false, null, Importance.LOW,
-                "批量模式下是否把每条记录包成 {\"metadata\":{topic,partition,offset,timestamp},\"value\":...}；"
-                        + "开启后下游才能按坐标去重，关闭则数组元素就是原始 value。");
-        def.define(VALUE_FORMAT, Type.STRING, "auto", ValidString.in("auto", "string", "json", "bytes"),
-                Importance.MEDIUM,
-                "请求体的取值方式。auto：字符串原样输出、Struct/Map 转 JSON、byte[] 按 value.bytes.encoding；"
-                        + "string：强制 toString；json：强制按 JSON 序列化；bytes：byte[] 直传 BASE64。");
-        def.define(VALUE_BYTES_ENCODING, Type.STRING, "base64", ValidString.in("base64", "utf8"), Importance.LOW,
-                "byte[] 型 value 的编码方式。");
-        def.define(METADATA_HEADERS_ENABLE, Type.BOOLEAN, true, null, Importance.LOW,
-                "是否带上 X-Kafka-Topic / X-Kafka-Partition / X-Kafka-Offset / X-Kafka-Timestamp / X-Kafka-Key，"
-                        + "下游可据此做幂等去重。");
-        def.define(HEADER_FORWARD, Type.BOOLEAN, false, null, Importance.LOW,
-                "是否把记录自带的 headers 透传为 x-kafka-header-* 请求头（__connect.errors.* 会跳过）。");
+        def.define(HTTP_DELIVERY_BUDGET_MS, Type.INT, 60_000, Range.atLeast(0), Importance.HIGH,
+                "单次 put() 的总时间预算，0 表示不限。必须明显小于 consumer.max.poll.interval.ms，"
+                        + "否则一次下游变慢就会触发 rebalance 并放大重复投递。");
 
-        def.define(AUTH_TYPE, Type.STRING, "none", ValidString.in("none", "basic", "bearer"), Importance.MEDIUM,
-                "认证方式：none / basic / bearer。");
-        def.define(AUTH_USERNAME, Type.STRING, null, null, Importance.MEDIUM, "basic 认证的用户名。");
-        def.define(AUTH_PASSWORD, Type.PASSWORD, null, null, Importance.MEDIUM, "basic 认证的密码。");
-        def.define(AUTH_TOKEN, Type.PASSWORD, null, null, Importance.MEDIUM, "bearer 认证的令牌。");
+        def.define(HTTP_RETRY_MAX, Type.INT, 8, Range.atLeast(0), Importance.HIGH,
+                "单条（批）记录在插件内最多重试几次。框架层的 errors.retry.* 仍作为兜底。");
 
-        def.define(TLS_TRUSTSTORE_PATH, Type.STRING, null, null, Importance.LOW,
-                "自定义信任库路径（JKS/PKCS12），用于自签证书。");
-        def.define(TLS_TRUSTSTORE_PASSWORD, Type.PASSWORD, null, null, Importance.LOW, "信任库密码。");
-        def.define(TLS_TRUSTSTORE_TYPE, Type.STRING, "JKS", ValidString.in("JKS", "PKCS12"), Importance.LOW,
-                "信任库类型。");
-        def.define(TLS_INSECURE_SKIP_VERIFY, Type.BOOLEAN, false, null, Importance.LOW,
-                "跳过 TLS 证书校验。仅用于联调，生产环境开启等于放弃传输安全。");
+        def.define(HTTP_RETRY_BACKOFF_MS, Type.INT, 500, Range.atLeast(0), Importance.MEDIUM,
+                "首次退避时长，之后按指数增长。");
+
+        def.define(HTTP_RETRY_BACKOFF_MAX_MS, Type.INT, 30_000, Range.atLeast(0), Importance.MEDIUM,
+                "退避上限，同时约束下游 Retry-After 的最大值。");
+
+        def.define(HTTP_RETRY_JITTER_MS, Type.INT, 250, Range.atLeast(0), Importance.LOW,
+                "退避抖动上限。多个 task 同时被同一个下游拒绝时，抖动能避免它们一起重试。");
+
+        def.define(HTTP_METADATA_HEADERS, Type.BOOLEAN, true, Importance.MEDIUM,
+                "是否把源坐标（topic/partition/offset/timestamp/key）与幂等键写进请求头。");
+
+        def.define(HTTP_HEADER_FORWARD, Type.LIST, Collections.emptyList(), Importance.LOW,
+                "把哪些 Kafka 记录头透传成请求头（前缀 x-kafka-header-），* 表示全部。");
+
+        def.define(HTTP_PAYLOAD_FORMAT, Type.STRING, PayloadFormat.AUTO.configValue(),
+                ValidString.in(PayloadFormat.NAMES), Importance.HIGH,
+                "请求体渲染方式：auto 按值类型分派；json 一律序列化；text 一律当纯文本。");
+
+        def.define(HTTP_PAYLOAD_BYTES_ENCODING, Type.STRING, "base64", ValidString.in("base64", "utf8"),
+                Importance.LOW, "byte[] 值的编码方式。");
+
+        def.define(HTTP_BATCH_ENABLED, Type.BOOLEAN, false, Importance.MEDIUM,
+                "是否把多条记录拼成一个 JSON 数组一次发出。");
+
+        def.define(HTTP_BATCH_MAX_RECORDS, Type.INT, 100, Range.atLeast(1), Importance.MEDIUM,
+                "单批最多包含的记录数。");
+
+        def.define(HTTP_BATCH_ENVELOPE, Type.BOOLEAN, false, Importance.LOW,
+                "批量模式下是否把每条记录包成 {metadata, value}，以便下游按坐标做幂等。");
+
+        def.define(HTTP_BATCH_ISOLATE, Type.BOOLEAN, true, Importance.LOW,
+                "批量请求失败且属于记录级问题时，是否拆成单条重投以定位坏记录（可能产生重复投递）。");
+
+        def.define(HTTP_AUTH_TYPE, Type.STRING, "none", ValidString.in("none", "basic", "bearer"),
+                Importance.MEDIUM, "认证方式。");
+
+        def.define(HTTP_AUTH_USERNAME, Type.STRING, null, Importance.MEDIUM, "basic 认证的用户名。");
+        def.define(HTTP_AUTH_PASSWORD, Type.PASSWORD, null, Importance.MEDIUM, "basic 认证的密码。");
+        def.define(HTTP_AUTH_TOKEN, Type.PASSWORD, null, Importance.MEDIUM, "bearer 认证的令牌。");
+
+        def.define(TLS_TRUSTSTORE_PATH, Type.STRING, null, Importance.LOW,
+                "信任库路径，用于校验自签证书的服务端。");
+        def.define(TLS_TRUSTSTORE_PASSWORD, Type.PASSWORD, null, Importance.LOW, "信任库密码。");
+        def.define(TLS_TRUSTSTORE_TYPE, Type.STRING, "JKS", ValidString.in("JKS", "PKCS12"),
+                Importance.LOW, "信任库类型。");
+        def.define(TLS_INSECURE, Type.BOOLEAN, false, Importance.LOW,
+                "跳过服务端证书校验，仅限联调环境。");
+
+        def.define(BEHAVIOR_ON_ERROR, Type.STRING, "fail", ValidString.in("fail", "report", "skip"),
+                Importance.HIGH,
+                "记录级失败的处理方式：fail 抛给框架（由 errors.tolerance 决定进 DLQ 还是停任务）；"
+                        + "report 交给 ErrantRecordReporter 逐条进 DLQ 后继续；skip 直接丢弃（会丢数据）。");
+
+        def.define(HTTP_STATS_INTERVAL_MS, Type.INT, 60_000, Range.atLeast(0), Importance.LOW,
+                "投递汇总日志的间隔，0 表示关闭。");
 
         return def;
     }
 
+    /* ------------------------------------------------------------------ 校验 */
+
     /**
-     * 跨字段校验：ConfigDef 只能校验单键，这里补上与其它键相关的约束。
+     * 语义校验：ConfigDef 表达不了的跨字段约束。
      *
-     * <p>失败即 {@link ConfigException}，连接器会在 start 阶段直接 FAILED —— 比跑起来之后才在
-     * 第一条记录上炸更容易定位。
+     * <p>返回 {@code key → 错误信息} 而不是直接抛第一条：一次把问题说完，省一轮改配置重启。
+     *
+     * @param props 原始配置（未解析），供 {@link HttpSinkConnector#validate} 复用
      */
-    private void validateCrossField() {
-        final String url = urlTemplate();
-        if (url == null || url.isEmpty()) {
-            throw new ConfigException(HTTP_URL, null,
-                    "必须配置 http.url（老配置可用已废弃的 http.api.url）");
+    public static Map<String, List<String>> problems(final Map<String, ?> props) {
+        try {
+            new HttpSinkConfig(props);
+            return Map.of();
+        } catch (final ProblemsException e) {
+            return e.byKey();
+        } catch (final ConfigException e) {
+            // 类型/必填这一层由 ConfigDef.validate 报，这里不重复
+            return Map.of();
         }
-        final Matcher matcher = PLACEHOLDER.matcher(url);
-        while (matcher.find()) {
-            if (!"topic".equals(matcher.group(1))) {
-                throw new ConfigException(HTTP_URL, url,
-                        "不支持的占位符 ${" + matcher.group(1) + "}，目前只支持 ${topic}");
+    }
+
+    private void checkSemantics(final Problems problems, final List<String> notes) {
+        if (getInt(HTTP_RETRY_BACKOFF_MAX_MS) < getInt(HTTP_RETRY_BACKOFF_MS)) {
+            problems.add(HTTP_RETRY_BACKOFF_MAX_MS, "退避上限不能小于首次退避");
+        }
+        final int budget = getInt(HTTP_DELIVERY_BUDGET_MS);
+        if (budget > 0 && budget < getInt(HTTP_REQUEST_TIMEOUT_MS)) {
+            notes.add("http.delivery.budget.ms(" + budget + ") 小于 http.request.timeout.ms("
+                    + getInt(HTTP_REQUEST_TIMEOUT_MS) + ")，单次请求就可能吃掉整个预算");
+        }
+        if (getBoolean(HTTP_BATCH_ENABLED)) {
+            if (payloadFormat == PayloadFormat.TEXT) {
+                problems.add(HTTP_PAYLOAD_FORMAT,
+                        "批量模式会把多条记录拼成 JSON 数组，text 模式产出的纯文本无法组成合法数组");
+            }
+            if (!getBoolean(HTTP_METADATA_HEADERS)) {
+                notes.add("批量模式下不发源坐标头；需要幂等请打开 http.batch.envelope");
+            }
+        } else if (getBoolean(HTTP_BATCH_ENVELOPE)) {
+            notes.add("http.batch.envelope=true 只在批量模式下有意义");
+        }
+        if (getBoolean(HTTP_BATCH_ENABLED) && getBoolean(HTTP_BATCH_ISOLATE)) {
+            notes.add("http.batch.isolate.failures=true：批量失败后会拆单重投，下游需能接受重复投递");
+        }
+        if (authType == AuthType.NONE
+                && (getPassword(HTTP_AUTH_PASSWORD) != null || getPassword(HTTP_AUTH_TOKEN) != null)) {
+            notes.add("配了 http.auth.password/token 但 http.auth.type=none，认证不会生效");
+        }
+        if (getBoolean(TLS_INSECURE)) {
+            notes.add("http.tls.insecure=true：跳过服务端证书校验，仅限联调");
+        }
+        if (getString(HTTP_COMPRESSION).equals("gzip") && !getString(HTTP_CONTENT_TYPE).contains("json")) {
+            notes.add("开启 gzip 但 Content-Type 不是 JSON，确认下游能解压");
+        }
+    }
+
+    private UrlTemplate compileUrl(final Problems problems) {
+        try {
+            return UrlTemplate.compile(getString(HTTP_URL));
+        } catch (final IllegalArgumentException e) {
+            problems.add(HTTP_URL, e.getMessage());
+            return null;
+        }
+    }
+
+    private AuthType resolveAuth(final Problems problems) {
+        final AuthType type = AuthType.of(getString(HTTP_AUTH_TYPE));
+        switch (type) {
+            case BASIC -> {
+                final String user = getString(HTTP_AUTH_USERNAME);
+                if (user == null || user.isBlank()) {
+                    problems.add(HTTP_AUTH_USERNAME, "http.auth.type=basic 时用户名必填");
+                }
+                if (isEmpty(getPassword(HTTP_AUTH_PASSWORD))) {
+                    problems.add(HTTP_AUTH_PASSWORD, "http.auth.type=basic 时密码必填");
+                }
+            }
+            case BEARER -> {
+                if (isEmpty(getPassword(HTTP_AUTH_TOKEN))) {
+                    problems.add(HTTP_AUTH_TOKEN, "http.auth.type=bearer 时令牌必填");
+                }
+            }
+            case NONE -> {
+                // 无需额外字段
             }
         }
-
-        final String authType = getString(AUTH_TYPE);
-        if ("basic".equals(authType) && isBlank(getString(AUTH_USERNAME))) {
-            throw new ConfigException(AUTH_USERNAME, null, "http.auth.type=basic 时必须配置用户名");
-        }
-        if ("basic".equals(authType) && getPassword(AUTH_PASSWORD) == null) {
-            throw new ConfigException(AUTH_PASSWORD, null, "http.auth.type=basic 时必须配置密码");
-        }
-        if ("bearer".equals(authType) && getPassword(AUTH_TOKEN) == null) {
-            throw new ConfigException(AUTH_TOKEN, null, "http.auth.type=bearer 时必须配置令牌");
-        }
-        if (getInt(RETRY_BACKOFF_MAX_MS) < getInt(RETRY_BACKOFF_MS)) {
-            throw new ConfigException(RETRY_BACKOFF_MAX_MS, getInt(RETRY_BACKOFF_MAX_MS),
-                    "退避上限不能小于首次退避（retry.backoff.ms=" + getInt(RETRY_BACKOFF_MS) + "）");
-        }
-        if (getBoolean(TLS_INSECURE_SKIP_VERIFY)) {
-            log.warn("http.tls.insecure.skip.verify=true：已关闭 TLS 证书校验，仅可用于联调");
-        }
-        if (getBoolean(BATCH_ENABLED)) {
-            log.info("批量投递已开启：单请求最多 {} 条，下游必须把整批当作一个原子单元", getInt(BATCH_MAX_SIZE));
-        }
+        return type;
     }
 
-    /* ------------------------------------------------------------ 派生值 */
-
-    /** 目标 URL（优先 {@code http.url}，回落到已废弃的 {@code http.api.url}） */
-    public String urlTemplate() {
-        final String url = trimToNull(originals().get(HTTP_URL) == null ? null : getString(HTTP_URL));
-        return url != null ? url : trimToNull(getString(LEGACY_HTTP_API_URL));
+    private List<String> headerWarnings() {
+        final List<String> result = new ArrayList<>();
+        for (final String key : originals().keySet()) {
+            if (!key.regionMatches(true, 0, HTTP_HEADER_PREFIX, 0, HTTP_HEADER_PREFIX.length())) {
+                continue;
+            }
+            final String name = key.substring(HTTP_HEADER_PREFIX.length());
+            if (name.isEmpty() || !RequestHeaders.isToken(name)) {
+                result.add("请求头名不合法，将不会被发送: " + key);
+            } else if (RequestHeaders.isReserved(name)) {
+                result.add("请求头 " + name + " 由客户端或安全策略掌控，已忽略；请改用 http.content.type / http.auth.*");
+            }
+        }
+        for (final String name : getList(HTTP_HEADER_FORWARD)) {
+            if (!RequestHeaders.FORWARD_ALL.equals(name) && !RequestHeaders.isToken(name)) {
+                result.add("http.header.forward 里的 " + name + " 不是合法的头名");
+            }
+        }
+        return result;
     }
 
-    /** 把 {@code ${topic}} 替换成实际 topic；没有占位符时原样返回 */
-    public String urlFor(final String topic) {
-        return urlTemplate().replace("${topic}", topic == null ? "" : topic);
+    private static boolean isEmpty(final org.apache.kafka.common.config.types.Password value) {
+        return value == null || value.value() == null || value.value().isEmpty();
+    }
+
+    /* ------------------------------------------------------------------ 访问器 */
+
+    public UrlTemplate urlTemplate() {
+        return urlTemplate;
+    }
+
+    public PayloadFormat payloadFormat() {
+        return payloadFormat;
+    }
+
+    public boolean bytesAsBase64() {
+        return bytesAsBase64;
+    }
+
+    public AuthType authType() {
+        return authType;
+    }
+
+    public Behavior behavior() {
+        return behavior;
+    }
+
+    /** 启动时该让运维看见的提醒（不影响启动） */
+    public List<String> warnings() {
+        return warnings;
+    }
+
+    public String basicUser() {
+        return getString(HTTP_AUTH_USERNAME);
+    }
+
+    public char[] basicPassword() {
+        return passwordChars(HTTP_AUTH_PASSWORD);
+    }
+
+    public char[] bearerToken() {
+        return passwordChars(HTTP_AUTH_TOKEN);
+    }
+
+    private char[] passwordChars(final String key) {
+        final org.apache.kafka.common.config.types.Password value = getPassword(key);
+        return value == null ? null : value.value().toCharArray();
+    }
+
+    public HttpClient.Version httpVersion() {
+        return "HTTP_2".equals(getString(HTTP_PROTOCOL)) ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1;
+    }
+
+    public boolean gzip() {
+        return "gzip".equals(getString(HTTP_COMPRESSION));
     }
 
     /**
-     * {@code http.header.*} 收集到的自定义请求头。
+     * {@code http.headers.*} 收集到的自定义请求头。
      *
-     * <p>{@code content-type} 会被单独取出（老配置用它设置 Content-Type），不重复放进请求头。
+     * <p>非法名与保留名在这里被静默跳过，原因在 {@link #warnings()} 里说明。
      */
     public Map<String, String> customHeaders() {
         final Map<String, String> headers = new LinkedHashMap<>();
-        for (final Map.Entry<String, Object> entry : originalsWithPrefix(HTTP_HEADER_PREFIX).entrySet()) {
-            final String name = entry.getKey();
-            if (name == null || name.isBlank()) {
+        for (final Map.Entry<String, Object> entry : originals().entrySet()) {
+            final String key = entry.getKey();
+            if (!key.regionMatches(true, 0, HTTP_HEADER_PREFIX, 0, HTTP_HEADER_PREFIX.length())) {
                 continue;
             }
-            if ("content-type".equalsIgnoreCase(name)) {
+            final String name = key.substring(HTTP_HEADER_PREFIX.length());
+            if (name.isEmpty() || !RequestHeaders.isToken(name) || RequestHeaders.isReserved(name)) {
                 continue;
             }
-            headers.put(name, String.valueOf(entry.getValue()));
+            final String value = entry.getValue() == null ? "" : String.valueOf(entry.getValue());
+            headers.put(name, RequestHeaders.sanitize(value));
         }
         return headers;
     }
 
-    /** Content-Type：显式配置优先，其次老配置的 {@code http.header.content-type} */
-    public String contentType() {
-        final Object legacy = originalsWithPrefix(HTTP_HEADER_PREFIX).get("content-type");
-        if (legacy != null && !String.valueOf(legacy).isBlank()) {
-            return String.valueOf(legacy);
+    /** 不打印任何密钥的配置摘要，供启动日志使用 */
+    public String summary() {
+        return "url=" + urlTemplate.template()
+                + " method=" + getString(HTTP_METHOD)
+                + " protocol=" + getString(HTTP_PROTOCOL)
+                + " format=" + payloadFormat.configValue()
+                + " batch=" + getBoolean(HTTP_BATCH_ENABLED)
+                + " retry=" + getInt(HTTP_RETRY_MAX) + "x/" + getInt(HTTP_RETRY_BACKOFF_MS) + "ms"
+                + " budget=" + getInt(HTTP_DELIVERY_BUDGET_MS) + "ms"
+                + " auth=" + authType.name().toLowerCase(Locale.ROOT)
+                + " behavior=" + behavior.configValue();
+    }
+
+    /* ------------------------------------------------------------------ 枚举 */
+
+    public enum AuthType {
+        NONE, BASIC, BEARER;
+
+        static AuthType of(final String raw) {
+            return switch (raw == null ? "none" : raw.toLowerCase(Locale.ROOT)) {
+                case "basic" -> BASIC;
+                case "bearer" -> BEARER;
+                default -> NONE;
+            };
         }
-        return getString(HTTP_CONTENT_TYPE);
     }
 
-    public int maxRetries() {
-        return getInt(MAX_RETRIES);
-    }
+    public enum Behavior {
+        /** 抛给框架：由 errors.tolerance 决定进 DLQ 还是让任务失败 */
+        FAIL("fail"),
+        /** 交给 ErrantRecordReporter 逐条进 DLQ，任务继续跑 */
+        REPORT("report"),
+        /** 直接丢弃，会丢数据 */
+        SKIP("skip");
 
-    public int retryBackoffMs() {
-        return getInt(RETRY_BACKOFF_MS);
-    }
+        private final String configValue;
 
-    public int retryBackoffMaxMs() {
-        return getInt(RETRY_BACKOFF_MAX_MS);
-    }
-
-    public int retryJitterMs() {
-        return getInt(RETRY_JITTER_MS);
-    }
-
-    public int retryTotalTimeoutMs() {
-        return getInt(HTTP_RETRY_TOTAL_TIMEOUT_MS);
-    }
-
-    public String basicUser() {
-        return getString(AUTH_USERNAME);
-    }
-
-    public char[] basicPassword() {
-        final org.apache.kafka.common.config.types.Password password = getPassword(AUTH_PASSWORD);
-        return password == null ? null : password.value().toCharArray();
-    }
-
-    public char[] bearerToken() {
-        final org.apache.kafka.common.config.types.Password token = getPassword(AUTH_TOKEN);
-        return token == null ? null : token.value().toCharArray();
-    }
-
-    static boolean isBlank(final String text) {
-        return text == null || text.isBlank();
-    }
-
-    private static String trimToNull(final String text) {
-        if (text == null) {
-            return null;
-        }
-        final String trimmed = text.trim();
-        return trimmed.isEmpty() ? null : trimmed;
-    }
-
-    /** URL 校验：允许占位符，但替换后必须能解析成 http/https 地址 */
-    static final class UrlValidator implements ConfigDef.Validator {
-        @Override
-        public void ensureValid(final String name, final Object value) {
-            if (value == null) {
-                return;
-            }
-            final String text = String.valueOf(value).trim();
-            if (text.isEmpty()) {
-                return;
-            }
-            try {
-                final URI uri = new URI(text.replace("${topic}", "probe"));
-                final String scheme = uri.getScheme();
-                if (scheme == null
-                        || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
-                    throw new ConfigException(name, value, "只支持 http / https 协议");
-                }
-                if (uri.getHost() == null || uri.getHost().isBlank()) {
-                    throw new ConfigException(name, value, "缺少主机名");
-                }
-            } catch (final URISyntaxException e) {
-                throw new ConfigException(name, value, "不是合法的 URL: " + e.getMessage());
-            }
+        Behavior(final String configValue) {
+            this.configValue = configValue;
         }
 
-        @Override
-        public String toString() {
-            return "http/https URL";
+        public String configValue() {
+            return configValue;
         }
+
+        static Behavior of(final String raw) {
+            return switch (raw == null ? "fail" : raw.toLowerCase(Locale.ROOT)) {
+                case "report" -> REPORT;
+                case "skip" -> SKIP;
+                default -> FAIL;
+            };
+        }
+    }
+
+    /* ------------------------------------------------------------------ 跨字段问题容器 */
+
+    /**
+     * 跨字段校验的问题收集器。
+     *
+     * <p>先收集再抛，而不是遇到第一条就抛：一次把问题说完，省一轮"改配置 → 重启 → 再报错"。
+     */
+    private static final class Problems {
+        private final Map<String, List<String>> byKey = new LinkedHashMap<>();
+
+        void add(final String key, final String message) {
+            byKey.computeIfAbsent(key, ignored -> new ArrayList<>()).add(message);
+        }
+
+        boolean isEmpty() {
+            return byKey.isEmpty();
+        }
+
+        Map<String, List<String>> byKey() {
+            return Map.copyOf(byKey);
+        }
+
+        String message() {
+            final List<String> lines = new ArrayList<>();
+            byKey.forEach((key, messages) -> messages.forEach(message -> lines.add(key + ": " + message)));
+            return String.join("; ", lines);
+        }
+    }
+
+    /**
+     * 承载"按字段分组"的校验错误。
+     *
+     * <p>做成异常的子类只是为了让 {@link HttpSinkConnector#validate} 能把错误挂到具体输入框上，
+     * 消息本身仍然是一句能直接给人看的话。
+     */
+    public static final class ProblemsException extends ConfigException {
+        private static final long serialVersionUID = 1L;
+
+        private final Map<String, List<String>> byKey;
+
+        ProblemsException(final String message, final Map<String, List<String>> byKey) {
+            super(message);
+            this.byKey = byKey;
+        }
+
+        public Map<String, List<String>> byKey() {
+            return byKey;
+        }
+    }
+
+    /** 仅用于单测与日志断言：允许读取全部键名 */
+    public static Set<String> definedKeys() {
+        return DEFINITION.names();
+    }
+
+    public static ConfigDef configDef() {
+        return DEFINITION;
     }
 }

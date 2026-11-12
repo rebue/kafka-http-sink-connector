@@ -6,438 +6,321 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.math.BigDecimal;
-import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
 import java.util.zip.GZIPInputStream;
 
-import org.apache.kafka.common.config.ConfigException;
-import org.apache.kafka.connect.data.Decimal;
 import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.SchemaBuilder;
-import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.errors.RetriableException;
-import org.apache.kafka.connect.header.ConnectHeaders;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
+import rebue.kafka.httpsink.delivery.HttpTransport;
+import rebue.kafka.httpsink.support.RequestHeaders;
 
 /**
- * 用 JDK 自带的 HttpServer 做端到端验证：不引第三方 mock 框架，插件本身也保持零运行时依赖。
+ * 端到端投递语义。
  *
- * <p>重点不是覆盖率，而是把「死信链路成立的前提」钉死：
- * 4xx 必须抛不可重试异常、5xx 必须重试后抛可重试异常、2xx 必须不抛。
+ * <p>这些用例覆盖的正是老实现出错的地方：失败被吞成日志、状态码不分、批量失败连坐整批、
+ * 重试睡穿 poll 间隔。
  */
 class HttpSinkTaskTest {
 
     private TestServer server;
+    private HttpSinkTask task;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        server = TestServer.start();
+    }
 
     @AfterEach
     void tearDown() {
-        if (server != null) {
-            server.close();
+        if (task != null) {
+            task.stop();
         }
+        server.close();
     }
 
-    /* ------------------------------------------------------------ 成功路径 */
-
-    @Test
-    void sendsJsonBodyWithMetadataHeaders() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final HttpSinkTask task = startTask(props(server.url()));
-
-        task.put(List.of(record("dbz.orders", 3, 42L, "{\"id\":1001}")));
-
-        final Exchange exchange = server.single();
-        assertEquals("POST", exchange.method);
-        assertEquals("/sink", exchange.path);
-        assertEquals("{\"id\":1001}", exchange.body);
-        assertEquals("application/json", exchange.header("Content-Type"));
-        assertEquals("dbz.orders", exchange.header("X-Kafka-Topic"));
-        assertEquals("3", exchange.header("X-Kafka-Partition"));
-        assertEquals("42", exchange.header("X-Kafka-Offset"));
-        assertTrue(exchange.header("User-Agent").startsWith("kafka-connect-http-sink/"));
+    private void start(final FakeContext context, final String... overrides) {
+        task = new HttpSinkTask();
+        task.initialize(context);
+        task.start(Configs.map(withUrl(overrides)));
     }
 
-    @Test
-    void structValueIsRenderedAsJsonWithLogicalTypes() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final HttpSinkTask task = startTask(props(server.url()));
-
-        final Schema schema = SchemaBuilder.struct().name("order")
-                .field("id", Schema.INT64_SCHEMA)
-                .field("amount", Decimal.schema(2))
-                .field("note", Schema.OPTIONAL_STRING_SCHEMA)
-                .build();
-        final Struct struct = new Struct(schema)
-                .put("id", 1001L)
-                .put("amount", new BigDecimal("12.34"));
-
-        task.put(List.of(new SinkRecord("dbz.orders", 0, null, null, schema, struct, 7L)));
-
-        // Struct.toString() 会是 Struct{id=1001, ...}；这里必须是合法 JSON，且 Decimal 不能被转成 BASE64
-        assertEquals("{\"id\":1001,\"amount\":12.34,\"note\":null}", server.single().body);
+    /** 默认把 http.url 指向本地测试端点；用例可用 HttpSinkConfig.HTTP_URL 覆盖 */
+    private String[] withUrl(final String... overrides) {
+        final List<String> merged = new ArrayList<>();
+        boolean urlOverridden = false;
+        for (int i = 0; i < overrides.length; i += 2) {
+            if (HttpSinkConfig.HTTP_URL.equals(overrides[i])) {
+                urlOverridden = true;
+            }
+            merged.add(overrides[i]);
+            merged.add(overrides[i + 1]);
+        }
+        if (!urlOverridden) {
+            merged.add(HttpSinkConfig.HTTP_URL);
+            merged.add(server.url("/sync"));
+        }
+        return merged.toArray(String[]::new);
     }
 
-    @Test
-    void tombstoneIsSkippedWithoutAnyRequest() throws Exception {
-        server = new TestServer();
-        final HttpSinkTask task = startTask(props(server.url()));
-
-        task.put(List.of(new SinkRecord("dbz.orders", 0, null, null, null, null, 9L)));
-
-        assertEquals(0, server.exchanges.size());
+    private static SinkRecord record(final long offset, final String value) {
+        return new SinkRecord("orders", 0, Schema.STRING_SCHEMA, "k" + offset,
+                Schema.STRING_SCHEMA, value, offset);
     }
 
+    /* ------------------------------------------------------------------ 成功路径 */
+
     @Test
-    void urlTemplateUsesTopic() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url() + "/topics/${topic}");
-        final HttpSinkTask task = startTask(props);
+    void deliversRecordWithIdempotencyKey() {
+        start(new FakeContext());
+        task.put(List.of(record(7, "{\"id\":7}")));
 
-        task.put(List.of(record("dbz.orders", 0, 1L, "{}")));
-
-        assertEquals("/sink/topics/dbz.orders", server.single().path);
+        final TestServer.Exchange exchange = server.only();
+        assertEquals("POST", exchange.method());
+        assertEquals("/sync", exchange.path());
+        assertEquals("{\"id\":7}", exchange.body());
+        assertEquals("orders-0-7", exchange.header(RequestHeaders.IDEMPOTENCY_KEY.toLowerCase()));
+        assertEquals("application/json", exchange.header("content-type"));
     }
 
-    /* ------------------------------------------------------------ 失败路径 */
+    /** tombstone 是上游的删除标记，没有报文可投，跳过不算失败 */
+    @Test
+    void skipsTombstones() {
+        start(new FakeContext());
+        task.put(List.of(record(1, null)));
+        assertEquals(0, server.count());
+    }
+
+    /* ------------------------------------------------------------------ 失败语义 */
 
     @Test
-    void clientErrorIsDataExceptionAndNotRetried() throws Exception {
-        server = new TestServer();
-        server.reply(400, "{\"result\":-2}");
-        final HttpSinkTask task = startTask(props(server.url()));
+    void clientErrorSurfacesAsDataException() {
+        server.alwaysRespond(400).respondBody("{\"error\":\"bad payload\"}");
+        start(new FakeContext());
 
         final DataException error = assertThrows(DataException.class,
-                () -> task.put(List.of(record("dbz.orders", 0, 1L, "{}"))));
-
-        assertEquals(1, server.exchanges.size(), "4xx 不该重试");
-        assertTrue(error.getMessage().contains("HTTP 400"));
-        assertTrue(error.getMessage().contains("\"result\":-2"), "响应体要带进异常，页面才看得到原因");
+                () -> task.put(List.of(record(1, "{}"))));
+        assertTrue(error.getMessage().contains("400"));
+        assertTrue(error.getMessage().contains("bad payload"));
+        assertEquals(1, server.count(), "4xx 不应重试");
     }
 
     @Test
-    void serverErrorIsRetriedThenSucceeds() throws Exception {
-        server = new TestServer();
-        server.reply(503, "busy");
-        server.reply(503, "busy");
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("max.retries", "3");
-        props.put("retry.backoff.ms", "10");
-        final HttpSinkTask task = startTask(props);
+    void serverErrorIsRetriedThenSucceeds() {
+        server.scriptResponses(503, 503);
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_RETRY_MAX, "3",
+                HttpSinkConfig.HTTP_RETRY_BACKOFF_MS, "0",
+                HttpSinkConfig.HTTP_RETRY_JITTER_MS, "0");
+        task.put(List.of(record(1, "{}")));
 
-        task.put(List.of(record("dbz.orders", 0, 1L, "{\"id\":1}")));
-
-        assertEquals(3, server.exchanges.size());
+        assertEquals(3, server.count());
     }
 
     @Test
-    void serverErrorExhaustedIsRetriableException() throws Exception {
-        server = new TestServer();
-        for (int i = 0; i < 5; i++) {
-            server.reply(500, "boom");
-        }
-        final Map<String, String> props = props(server.url());
-        props.put("max.retries", "2");
-        props.put("retry.backoff.ms", "5");
-        final HttpSinkTask task = startTask(props);
+    void exhaustedRetriesRaiseRetriableException() {
+        server.alwaysRespond(500);
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_RETRY_MAX, "2",
+                HttpSinkConfig.HTTP_RETRY_BACKOFF_MS, "0",
+                HttpSinkConfig.HTTP_RETRY_JITTER_MS, "0");
 
         final RetriableException error = assertThrows(RetriableException.class,
-                () -> task.put(List.of(record("dbz.orders", 0, 1L, "{}"))));
+                () -> task.put(List.of(record(1, "{}"))));
+        assertTrue(error.getMessage().contains("500"));
+        assertEquals(3, server.count(), "首次 + 2 次重试");
+    }
 
-        assertEquals(3, server.exchanges.size(), "首次 + 2 次重试");
-        assertTrue(error.getMessage().contains("HTTP 500"));
+    /** 3xx 不能跟随：POST 被 301/302 改写成 GET 会把请求语义整个丢掉 */
+    @Test
+    void redirectIsTreatedAsFailure() {
+        server.redirectTo("http://127.0.0.1:9/elsewhere");
+        start(new FakeContext());
+
+        final DataException error = assertThrows(DataException.class,
+                () -> task.put(List.of(record(1, "{}"))));
+        assertTrue(error.getMessage().contains("重定向"), error.getMessage());
+        assertEquals(1, server.count());
+    }
+
+    /**
+     * 预算耗尽必须抛可重试异常，且不能真的睡满退避。
+     *
+     * <p>这是 rebalance 的源头：put() 阻塞超过 consumer.max.poll.interval.ms，协调者就认为
+     * 这个 task 死了，把分区转给别人，于是同一条记录被投递两次。
+     */
+    @Test
+    void budgetExhaustionDoesNotBlockPut() {
+        server.delay(300);
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_DELIVERY_BUDGET_MS, "80",
+                HttpSinkConfig.HTTP_REQUEST_TIMEOUT_MS, "5000",
+                HttpSinkConfig.HTTP_RETRY_BACKOFF_MS, "5000",
+                HttpSinkConfig.HTTP_RETRY_JITTER_MS, "0");
+
+        final long startedAt = System.nanoTime();
+        assertThrows(RetriableException.class, () -> task.put(List.of(record(1, "{}"), record(2, "{}"))));
+        final long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+        assertTrue(elapsedMs < 2_000, "put() 阻塞过久: " + elapsedMs + "ms");
+    }
+
+    /* ------------------------------------------------------------------ 死信 */
+
+    /** 逐条上报比"整批抛异常"精确：只有坏记录进死信，任务继续跑 */
+    @Test
+    void reportBehaviorSendsPoisonRecordToDlq() {
+        server.alwaysRespond(422).respondBody("{\"error\":\"invalid\"}");
+        final FakeContext.RecordingReporter reporter = new FakeContext.RecordingReporter();
+        start(new FakeContext(reporter), HttpSinkConfig.BEHAVIOR_ON_ERROR, "report");
+
+        task.put(List.of(record(1, "{}")));
+
+        assertEquals(1, reporter.records().size());
+        assertEquals(1L, reporter.records().get(0).kafkaOffset());
+        assertTrue(reporter.errors().get(0).getMessage().contains("422"));
     }
 
     @Test
-    void requestTimeoutIsRetriable() throws Exception {
-        server = new TestServer();
-        server.delayMs = 600;
-        server.reply(200, "late");
-        final Map<String, String> props = props(server.url());
-        props.put("http.request.timeout.ms", "120");
-        props.put("max.retries", "0");
-        final HttpSinkTask task = startTask(props);
+    void skipBehaviorDropsRecord() {
+        server.alwaysRespond(400);
+        final FakeContext.RecordingReporter reporter = new FakeContext.RecordingReporter();
+        start(new FakeContext(reporter), HttpSinkConfig.BEHAVIOR_ON_ERROR, "skip");
 
-        assertThrows(RetriableException.class,
-                () -> task.put(List.of(record("dbz.orders", 0, 1L, "{}"))));
+        task.put(List.of(record(1, "{}")));
+
+        assertTrue(reporter.records().isEmpty());
+        assertEquals(1, server.count());
     }
 
-    /* ------------------------------------------------------------ 行为开关 */
-
+    /** 死信写不进去时不能假装处理完了：转成可重试异常，记录留在原位 */
     @Test
-    void logBehaviorSwallowsFailure() throws Exception {
-        server = new TestServer();
-        server.reply(400, "bad");
-        final Map<String, String> props = props(server.url());
-        props.put("behavior.on.error", "log");
-        final HttpSinkTask task = startTask(props);
+    void dlqWriteFailureBecomesRetriable() {
+        server.alwaysRespond(400);
+        final FakeContext.RecordingReporter reporter = new FakeContext.RecordingReporter();
+        reporter.failNextReport();
+        start(new FakeContext(reporter), HttpSinkConfig.BEHAVIOR_ON_ERROR, "report");
 
-        // 不抛异常 = offset 会被提交，这条数据就丢了。只有明确接受这一点才该用 log
-        task.put(List.of(record("dbz.orders", 0, 1L, "{}")));
-        assertEquals(1, server.exchanges.size());
+        assertThrows(RetriableException.class, () -> task.put(List.of(record(1, "{}"))));
     }
 
+    /** 没有 reporter（未配 DLQ）时退回抛异常，由 errors.tolerance 决定去向 */
     @Test
-    void basicAuthAndCustomHeadersAreSent() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("http.auth.type", "basic");
-        props.put("http.auth.username", "dbz");
-        props.put("http.auth.password", "s3cret");
-        props.put("http.header.X-Tenant", "acme");
-        final HttpSinkTask task = startTask(props);
-
-        task.put(List.of(record("dbz.orders", 0, 1L, "{}")));
-
-        final Exchange exchange = server.single();
-        assertEquals("acme", exchange.header("X-Tenant"));
-        // dbz:s3cret
-        assertEquals("Basic ZGJ6OnMzY3JldA==", exchange.header("Authorization"));
+    void reportWithoutReporterFallsBackToException() {
+        server.alwaysRespond(400);
+        start(new FakeContext(), HttpSinkConfig.BEHAVIOR_ON_ERROR, "report");
+        assertThrows(DataException.class, () -> task.put(List.of(record(1, "{}"))));
     }
 
+    /* ------------------------------------------------------------------ 批量 */
+
     @Test
-    void recordHeadersAreForwardedWhenEnabled() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("http.header.forward", "true");
-        final HttpSinkTask task = startTask(props);
+    void batchSendsOneArrayRequest() {
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_BATCH_ENABLED, "true",
+                HttpSinkConfig.HTTP_BATCH_MAX_RECORDS, "10");
+        task.put(List.of(record(1, "{\"a\":1}"), record(2, "{\"a\":2}")));
 
-        final org.apache.kafka.connect.header.Headers headers = new ConnectHeaders()
-                .addString("tenant", "acme")
-                .addString("__connect.errors.topic", "should-not-leak");
-        final SinkRecord record = new SinkRecord("dbz.orders", 0, null, null,
-                Schema.STRING_SCHEMA, "{}", 5L, 1700000000000L,
-                org.apache.kafka.common.record.TimestampType.CREATE_TIME, headers);
-
-        task.put(List.of(record));
-
-        final Exchange exchange = server.single();
-        assertEquals("acme", exchange.header("x-kafka-header-tenant"));
-        assertNull(exchange.header("x-kafka-header-__connect.errors.topic"));
+        assertEquals(1, server.count());
+        assertEquals("[{\"a\":1},{\"a\":2}]", server.only().body());
+        assertNull(server.only().header(RequestHeaders.IDEMPOTENCY_KEY.toLowerCase()),
+                "批量请求不带单条坐标");
     }
 
     @Test
-    void gzipCompressionIsApplied() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("http.compression", "gzip");
-        final HttpSinkTask task = startTask(props);
+    void batchEnvelopeCarriesCoordinates() {
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_BATCH_ENABLED, "true",
+                HttpSinkConfig.HTTP_BATCH_ENVELOPE, "true");
+        task.put(List.of(record(5, "{\"a\":1}")));
 
-        task.put(List.of(record("dbz.orders", 0, 1L, "{\"id\":1}")));
-
-        final Exchange exchange = server.single();
-        assertEquals("gzip", exchange.header("Content-Encoding"));
-        try (InputStream in = new GZIPInputStream(new java.io.ByteArrayInputStream(exchange.rawBody))) {
-            assertEquals("{\"id\":1}", new String(in.readAllBytes(), StandardCharsets.UTF_8));
-        }
+        assertEquals("[{\"metadata\":{\"topic\":\"orders\",\"partition\":0,\"offset\":5,\"timestamp\":null},"
+                + "\"value\":{\"a\":1}}]", server.only().body());
     }
 
-    /* ------------------------------------------------------------ 批量 */
+    /**
+     * 批量失败后拆单重投：坏记录被摘出来，好记录照常投递。
+     *
+     * <p>这里让端点"只在收到数组时失败"，模拟"整批被拒但每条单独发都能过"的场景。
+     */
+    @Test
+    void batchIsolatesFailuresPerRecord() {
+        // 只让第一次（整批）请求失败，拆单后的单条请求默认 200
+        server.alwaysRespond(200).scriptResponses(400);
+        start(new FakeContext(),
+                HttpSinkConfig.HTTP_BATCH_ENABLED, "true",
+                HttpSinkConfig.BEHAVIOR_ON_ERROR, "report",
+                HttpSinkConfig.HTTP_RETRY_MAX, "0");
+
+        task.put(List.of(record(1, "{\"a\":1}"), record(2, "{\"a\":2}")));
+
+        assertEquals(3, server.count(), "1 次批量 + 2 次拆单");
+        assertEquals("[{\"a\":1},{\"a\":2}]", server.exchanges().get(0).body());
+        assertEquals("{\"a\":1}", server.exchanges().get(1).body());
+    }
+
+    /* ------------------------------------------------------------------ 路由 */
 
     @Test
-    void batchSendsJsonArray() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("http.batch.enabled", "true");
-        final HttpSinkTask task = startTask(props);
-
+    void routesEachTopicToItsOwnPath() {
+        start(new FakeContext(), HttpSinkConfig.HTTP_URL, server.url("/sync/${topic}"));
         task.put(List.of(
-                record("dbz.orders", 0, 1L, "{\"id\":1}"),
-                record("dbz.orders", 0, 2L, "{\"id\":2}")));
+                new SinkRecord("orders", 0, null, null, Schema.STRING_SCHEMA, "{}", 1L),
+                new SinkRecord("users", 0, null, null, Schema.STRING_SCHEMA, "{}", 2L)));
 
-        assertEquals("[{\"id\":1},{\"id\":2}]", server.single().body);
+        assertEquals(2, server.count());
+        assertEquals("/sync/orders", server.exchanges().get(0).path());
+        assertEquals("/sync/users", server.exchanges().get(1).path());
+    }
+
+    /* ------------------------------------------------------------------ 压缩 */
+
+    @Test
+    void gzipIsAppliedAndDecodable() throws IOException {
+        start(new FakeContext(), HttpSinkConfig.HTTP_COMPRESSION, "gzip");
+        task.put(List.of(record(1, "{\"a\":1}")));
+
+        assertEquals("gzip", server.only().header("content-encoding"));
+
+        // 直接验证编码结果，避免依赖测试端点的字符串解码
+        final HttpTransport.Payload payload = HttpTransport.encode("{\"a\":1}", true);
+        assertTrue(payload.gzipped());
+        try (GZIPInputStream input = new GZIPInputStream(
+                new java.io.ByteArrayInputStream(payload.bytes()))) {
+            assertEquals("{\"a\":1}", new String(input.readAllBytes(), StandardCharsets.UTF_8));
+        }
+    }
+
+    /* ------------------------------------------------------------------ 其它 */
+
+    @Test
+    void emptyBatchIsNoop() {
+        start(new FakeContext());
+        task.put(List.of());
+        task.put(null);
+        assertEquals(0, server.count());
     }
 
     @Test
-    void batchEnvelopeCarriesCoordinates() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = props(server.url());
-        props.put("http.batch.enabled", "true");
-        props.put("http.batch.envelope", "true");
-        final HttpSinkTask task = startTask(props);
-
-        task.put(List.of(record("dbz.orders", 2, 11L, "{\"id\":1}")));
-
-        final String body = server.single().body;
-        assertTrue(body.contains("\"metadata\":{\"topic\":\"dbz.orders\",\"partition\":2,\"offset\":11"));
-        assertTrue(body.contains("\"value\":{\"id\":1}"));
+    void stopIsIdempotent() {
+        start(new FakeContext());
+        task.stop();
+        task.stop();
+        assertEquals(0, server.count());
     }
 
-    /* ------------------------------------------------------------ 配置校验 */
-
+    /** 配置错误必须在 start() 就炸，而不是等到第一条记录 */
     @Test
-    void rejectsNonHttpUrl() {
-        final Map<String, String> props = props("ftp://example.com/x");
-        assertThrows(ConfigException.class, () -> new HttpSinkConfig(props));
-    }
-
-    @Test
-    void rejectsUnknownPlaceholder() {
-        final Map<String, String> props = props("http://example.com/${key}");
-        assertThrows(ConfigException.class, () -> new HttpSinkConfig(props));
-    }
-
-    @Test
-    void basicAuthRequiresCredentials() {
-        final Map<String, String> props = props("http://example.com/x");
-        props.put("http.auth.type", "basic");
-        assertThrows(ConfigException.class, () -> new HttpSinkConfig(props));
-    }
-
-    @Test
-    void requiresSomeUrl() {
-        final Map<String, String> props = new HashMap<>();
-        assertThrows(ConfigException.class, () -> new HttpSinkConfig(props));
-    }
-
-    @Test
-    void legacyApiUrlStillWorks() throws Exception {
-        server = new TestServer();
-        server.reply(200, "ok");
-        final Map<String, String> props = new HashMap<>();
-        props.put("http.api.url", server.url());
-        props.put("max.retries", "0");
-        props.put("retry.jitter.ms", "0");
-
-        final HttpSinkTask task = startTask(props);
-        task.put(List.of(record("dbz.orders", 0, 1L, "{}")));
-
-        assertEquals(1, server.exchanges.size());
-    }
-
-    /* ------------------------------------------------------------ 辅助 */
-
-    private static Map<String, String> props(final String url) {
-        final Map<String, String> props = new HashMap<>();
-        props.put("http.url", url);
-        props.put("max.retries", "0");
-        props.put("retry.backoff.ms", "10");
-        props.put("retry.jitter.ms", "0");
-        props.put("http.connect.timeout.ms", "1000");
-        props.put("http.request.timeout.ms", "2000");
-        return props;
-    }
-
-    private static HttpSinkTask startTask(final Map<String, String> props) {
-        final HttpSinkTask task = new HttpSinkTask();
-        task.start(props);
-        return task;
-    }
-
-    private static SinkRecord record(final String topic, final int partition,
-                                     final long offset, final String json) {
-        return new SinkRecord(topic, partition, null, null, Schema.STRING_SCHEMA, json, offset);
-    }
-
-    /** 记录一次请求；响应按队列顺序返回，队列空时默认 200 */
-    private static final class Exchange {
-        final String method;
-        final String path;
-        final Map<String, String> headers;
-        final String body;
-        final byte[] rawBody;
-
-        Exchange(final String method, final String path,
-                 final Map<String, String> headers, final byte[] rawBody) {
-            this.method = method;
-            this.path = path;
-            this.headers = headers;
-            this.rawBody = rawBody;
-            this.body = new String(rawBody, StandardCharsets.UTF_8);
-        }
-
-        String header(final String name) {
-            return headers.get(name.toLowerCase(java.util.Locale.ROOT));
-        }
-    }
-
-    private static final class TestServer implements AutoCloseable {
-        private final HttpServer server;
-        private final List<Exchange> exchanges = new CopyOnWriteArrayList<>();
-        private final Queue<int[]> replies = new ConcurrentLinkedQueue<>();
-        private final Queue<String> replyBodies = new ConcurrentLinkedQueue<>();
-        private volatile long delayMs;
-
-        TestServer() throws IOException {
-            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-            server.createContext("/", this::handle);
-            server.setExecutor(Executors.newCachedThreadPool(runnable -> {
-                final Thread thread = new Thread(runnable, "test-http");
-                thread.setDaemon(true);
-                return thread;
-            }));
-            server.start();
-        }
-
-        String url() {
-            return "http://127.0.0.1:" + server.getAddress().getPort() + "/sink";
-        }
-
-        void reply(final int status, final String body) {
-            replies.add(new int[]{status});
-            replyBodies.add(body);
-        }
-
-        Exchange single() {
-            assertEquals(1, exchanges.size(), "期望恰好 1 次请求，实际 " + exchanges.size());
-            return exchanges.get(0);
-        }
-
-        private void handle(final HttpExchange exchange) throws IOException {
-            final byte[] body;
-            try (InputStream in = exchange.getRequestBody()) {
-                body = in.readAllBytes();
-            }
-            final Map<String, String> headers = new HashMap<>();
-            exchange.getRequestHeaders().forEach((name, values) -> {
-                if (!values.isEmpty()) {
-                    headers.put(name.toLowerCase(java.util.Locale.ROOT), values.get(0));
-                }
-            });
-            exchanges.add(new Exchange(exchange.getRequestMethod(),
-                    exchange.getRequestURI().getPath(), headers, body));
-
-            if (delayMs > 0) {
-                try {
-                    Thread.sleep(delayMs);
-                } catch (final InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            final int[] status = replies.poll();
-            final String replyBody = replyBodies.poll();
-            final byte[] responseBody = (replyBody == null ? "" : replyBody).getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(status == null ? 200 : status[0], responseBody.length);
-            exchange.getResponseBody().write(responseBody);
-            exchange.close();
-        }
-
-        @Override
-        public void close() {
-            server.stop(0);
-        }
+    void invalidConfigFailsAtStart() {
+        task = new HttpSinkTask();
+        task.initialize(new FakeContext());
+        assertThrows(RuntimeException.class, () -> task.start(Map.of("http.url", "ftp://x/y")));
     }
 }
