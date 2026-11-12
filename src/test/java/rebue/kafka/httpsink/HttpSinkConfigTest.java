@@ -19,9 +19,19 @@ class HttpSinkConfigTest {
         final HttpSinkConfig config = Configs.of();
         assertEquals(PayloadFormat.AUTO, config.payloadFormat());
         assertEquals(HttpSinkConfig.AuthType.NONE, config.authType());
-        assertEquals(HttpSinkConfig.Behavior.FAIL, config.behavior());
+        // 配了 DLQ 的环境不该因为一条 4xx 停掉任务；没配 DLQ 时 report 会退回抛异常
+        assertEquals(HttpSinkConfig.Behavior.REPORT, config.behavior());
         assertFalse(config.gzip());
         assertTrue(config.warnings().isEmpty(), config.warnings().toString());
+    }
+
+    /** 默认值改了，但显式 fail 仍要能用（老配置不必被迫改） */
+    @Test
+    void explicitFailStillHonored() {
+        assertEquals(HttpSinkConfig.Behavior.FAIL,
+                Configs.of(HttpSinkConfig.BEHAVIOR_ON_ERROR, "fail").behavior());
+        assertEquals(HttpSinkConfig.Behavior.SKIP,
+                Configs.of(HttpSinkConfig.BEHAVIOR_ON_ERROR, "skip").behavior());
     }
 
     @Test

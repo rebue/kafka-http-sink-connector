@@ -104,7 +104,7 @@ class HttpSinkTaskTest {
     @Test
     void clientErrorSurfacesAsDataException() {
         server.alwaysRespond(400).respondBody("{\"error\":\"bad payload\"}");
-        start(new FakeContext());
+        start(new FakeContext(), HttpSinkConfig.BEHAVIOR_ON_ERROR, "fail");
 
         final DataException error = assertThrows(DataException.class,
                 () -> task.put(List.of(record(1, "{}"))));
@@ -143,7 +143,7 @@ class HttpSinkTaskTest {
     @Test
     void redirectIsTreatedAsFailure() {
         server.redirectTo("http://127.0.0.1:9/elsewhere");
-        start(new FakeContext());
+        start(new FakeContext(), HttpSinkConfig.BEHAVIOR_ON_ERROR, "fail");
 
         final DataException error = assertThrows(DataException.class,
                 () -> task.put(List.of(record(1, "{}"))));
@@ -186,6 +186,20 @@ class HttpSinkTaskTest {
         assertEquals(1, reporter.records().size());
         assertEquals(1L, reporter.records().get(0).kafkaOffset());
         assertTrue(reporter.errors().get(0).getMessage().contains("422"));
+    }
+
+    /** 不写 behavior.on.error 时也必须逐条进死信，这才是改默认值的意义 */
+    @Test
+    void defaultBehaviorReportsPoisonRecordToDlq() {
+        server.alwaysRespond(400);
+        final FakeContext.RecordingReporter reporter = new FakeContext.RecordingReporter();
+        start(new FakeContext(reporter));
+
+        // 不抛异常 = 任务继续跑、offset 能正常提交
+        task.put(List.of(record(1, "{}")));
+
+        assertEquals(1, reporter.records().size());
+        assertEquals(1L, reporter.records().get(0).kafkaOffset());
     }
 
     @Test

@@ -87,6 +87,15 @@ public final class HttpSinkConfig extends AbstractConfig {
     /* ------------------------------------------------------------------ 行为与观测 */
 
     public static final String BEHAVIOR_ON_ERROR = "behavior.on.error";
+    /**
+     * 记录级失败的默认行为。
+     *
+     * <p>配了 DLQ 就该逐条上报：{@code fail} 把异常抛回 {@code put()}，KIP-610 之后
+     * Connect 不再用 {@code errors.tolerance=all} 兜这类异常，结果是一条 4xx 让整个
+     * task 退出、offset 不提交、重启后反复重放同一条坏记录。没有 reporter 时
+     * {@code report} 仍会退回抛异常，所以这个默认值不会让没配 DLQ 的环境悄悄丢数据。
+     */
+    public static final String BEHAVIOR_ON_ERROR_DEFAULT = "report";
     public static final String HTTP_STATS_INTERVAL_MS = "http.stats.interval.ms";
 
     private static final ConfigDef DEFINITION = define();
@@ -201,10 +210,11 @@ public final class HttpSinkConfig extends AbstractConfig {
         def.define(TLS_INSECURE, Type.BOOLEAN, false, Importance.LOW,
                 "跳过服务端证书校验，仅限联调环境。");
 
-        def.define(BEHAVIOR_ON_ERROR, Type.STRING, "fail", ValidString.in("fail", "report", "skip"),
-                Importance.HIGH,
-                "记录级失败的处理方式：fail 抛给框架（由 errors.tolerance 决定进 DLQ 还是停任务）；"
-                        + "report 交给 ErrantRecordReporter 逐条进 DLQ 后继续；skip 直接丢弃（会丢数据）。");
+        def.define(BEHAVIOR_ON_ERROR, Type.STRING, BEHAVIOR_ON_ERROR_DEFAULT,
+                ValidString.in("fail", "report", "skip"), Importance.HIGH,
+                "记录级失败的处理方式（默认 report）：report 交给 ErrantRecordReporter 逐条进 DLQ 后继续；"
+                        + "fail 抛给框架（KIP-610 起 errors.tolerance=all 不兜 put() 异常，会让任务退出）；"
+                        + "skip 直接丢弃（会丢数据）。");
 
         def.define(HTTP_STATS_INTERVAL_MS, Type.INT, 60_000, Range.atLeast(0), Importance.LOW,
                 "投递汇总日志的间隔，0 表示关闭。");
@@ -446,7 +456,7 @@ public final class HttpSinkConfig extends AbstractConfig {
         }
 
         static Behavior of(final String raw) {
-            return switch (raw == null ? "fail" : raw.toLowerCase(Locale.ROOT)) {
+            return switch (raw == null ? BEHAVIOR_ON_ERROR_DEFAULT : raw.toLowerCase(Locale.ROOT)) {
                 case "report" -> REPORT;
                 case "skip" -> SKIP;
                 default -> FAIL;

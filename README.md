@@ -35,18 +35,25 @@ Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消�
 | --- | --- | --- |
 | 2xx | 成功 | 提交 offset |
 | 408 / 425 / 429 / 5xx | 可重试 | 插件内退避重试；用尽后抛 `RetriableException`，框架按 `errors.retry.*` 再来一轮，**不提交 offset** |
-| 3xx | 不可重试 | 抛 `DataException`（不跟随重定向：POST 被 301/302 改写为 GET 会丢掉请求语义） |
-| 400 / 404 / 409 / 415 / 422 … | 不可重试 | 抛 `DataException`，`errors.tolerance=all` 时进死信 |
-| 401 / 403 | 不可重试 | 抛 `DataException`，异常信息直接点明"检查 http.auth.*" |
+| 3xx | 不可重试 | 按 `behavior.on.error` 处理（不跟随重定向：POST 被 301/302 改写为 GET 会丢掉请求语义） |
+| 400 / 404 / 409 / 415 / 422 … | 不可重试 | 按 `behavior.on.error` 处理；默认 `report` 逐条进死信 |
+| 401 / 403 | 不可重试 | 按 `behavior.on.error` 处理，异常信息直接点明"检查 http.auth.*" |
 | 连接失败 / 读超时 / TLS 握手失败 | 可重试 | 同 5xx |
 | 序列化失败 | 不可重试 | 记录级问题，按 `behavior.on.error` 处理 |
 
 `behavior.on.error` 决定记录级失败怎么落地：
 
-- `fail`（默认）：抛给框架，由 `errors.tolerance` 决定进死信还是让任务失败。
-- `report`：交给 `ErrantRecordReporter` **逐条**进死信，任务继续跑、offset 正常提交。需要
-  同时配 `errors.tolerance=all` 与 `errors.deadletterqueue.topic.name`；否则自动退回 `fail`。
+- `report`（默认）：交给 `ErrantRecordReporter` **逐条**进死信，任务继续跑、offset 正常提交。
+  需要同时配 `errors.tolerance=all` 与 `errors.deadletterqueue.topic.name`；没有可用 reporter
+  时退回抛异常，不会悄悄丢数据。
+- `fail`：抛回 `put()`。**别和 `errors.tolerance=all` 搭着用**——KIP-610 把记录级错误的
+  容错责任交给 task 自己上报后，Connect 不再用 `errors.tolerance` 兜 `put()` 抛出的异常；
+  实际表现是一条 4xx 让整个 task 退出、offset 不提交、重启后反复重放同一条坏记录。
 - `skip`：直接丢弃，会丢数据，只在明确接受时才用。
+
+> 这一默认值从 `fail` 改为 `report`：平台已经建了死信链路，一条坏记录不该停掉整条管道。
+> 集群里若还混跑旧版插件（默认值是 `fail`），建议在连接器配置里**显式写**
+> `"behavior.on.error": "report"`，免得换 jar 前后行为不一致。
 
 > 逐条上报比"整批抛异常"精确：Connect 的 `put()` 是批量的，一条记录抛异常会连带整批走同一
 > 分支；`report` 只把真正失败的那几条送进死信。
@@ -94,7 +101,7 @@ Connect 因此认为投递成功并提交 offset：**4xx/5xx 的记录静默消�
 | `http.auth.token` | password | — | bearer 认证；`http.auth.type=bearer` 时必填 |
 | `http.tls.truststore.path` / `.password` / `.type` | string | — / — / `JKS` | 校验自签证书的服务端 |
 | `http.tls.insecure` | bool | `false` | 跳过证书校验，**仅限联调** |
-| `behavior.on.error` | string | `fail` | `fail` / `report` / `skip` |
+| `behavior.on.error` | string | `report` | `fail` / `report` / `skip`；配了 DLQ 就用 `report` |
 | `http.stats.interval.ms` | int | `60000` | 投递汇总日志间隔，0 关闭 |
 
 配置错误在 `POST/PUT /connectors` 时就会返回，并被 `PUT /connector-plugins/{class}/config/validate`

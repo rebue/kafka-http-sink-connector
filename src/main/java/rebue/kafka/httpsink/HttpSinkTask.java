@@ -87,15 +87,21 @@ public class HttpSinkTask extends SinkTask {
         this.reporter = reporter();
 
         log.info("HTTP Sink 已启动 版本={} {}", Version.VERSION, config.summary());
-        if (config.behavior() != HttpSinkConfig.Behavior.FAIL) {
-            log.warn("behavior.on.error={}：记录级失败不会让任务失败", config.behavior().configValue());
-        }
         if (config.behavior() == HttpSinkConfig.Behavior.SKIP) {
             log.warn("behavior.on.error=skip：失败的记录会被直接丢弃，且不会进入死信队列");
         }
-        if (config.behavior() == HttpSinkConfig.Behavior.REPORT && reporter == null) {
-            log.warn("behavior.on.error=report 但当前没有可用的 ErrantRecordReporter"
-                    + "（需要 errors.tolerance=all 且配置了死信 topic），将退化为抛异常");
+        if (config.behavior() == HttpSinkConfig.Behavior.REPORT) {
+            if (reporter == null) {
+                log.warn("behavior.on.error=report 但当前没有可用的 ErrantRecordReporter"
+                        + "（需要 errors.tolerance=all 且配置了死信 topic），将退化为抛异常");
+            } else {
+                // 默认路径，用 info：每个 task 启一次，不该当成告警刷屏
+                log.info("behavior.on.error=report：坏记录逐条进死信，任务继续消费");
+            }
+        }
+        if (config.behavior() == HttpSinkConfig.Behavior.FAIL) {
+            log.warn("behavior.on.error=fail：4xx 抛回 put() 会让任务退出，"
+                    + "errors.tolerance=all 不会兜住（KIP-610），建议改成 report");
         }
     }
 
